@@ -205,3 +205,41 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# --- Aura Clip (project-specific) ---
+# App artifacts
+exports/
+logs/
+*.log
+
+# Media files (avoid bloating the repo)
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.wav
+*.mp3
+*.flac
+*.aac
+*.m4a
+
+# Analysis / scratch outputs
+*.csv
+runs/
+
+# MoviePy / ffmpeg temp + caches
+*_temp*
+*.temp
+*.tmp
+temp/
+cache/
+moviepy*
+
+# Sample media: keep the README, ignore actual clips
+samples/*
+!samples/README.md
+
+# Prototype assets from design tools
+prototypes/*.fig
+prototypes/export/*
+!prototypes/*.md
