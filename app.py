@@ -16,21 +16,18 @@ from PyQt6.QtWidgets import (
     QMessageBox,
 )
 import sys
+import os
 
+# import the moviepy package as a namespace and detect availability
+try:
+    import moviepy as mp               
+    MOVIEPY_AVAILABLE = hasattr(mp, "VideoFileClip")  
+except Exception:
+    mp = None                          
+    MOVIEPY_AVAILABLE = False          
 
 class AuraClipApp(QMainWindow):
-    """
-    Main application window for Aura Clip.
-
-    In this early version, it only contains:
-    - Menu bar (Import, Detect, Export, Settings)
-    - Central placeholder label
-    - Status bar for showing messages
-
-    As I progress through the project, I'll replace the placeholder
-    label with our video player, detection results, and export controls.
-    """
-
+    
     def __init__(self):
         super().__init__()
 
@@ -38,13 +35,26 @@ class AuraClipApp(QMainWindow):
         self.setWindowTitle("Aura Clip - Scene Detection R&D")
         self.setGeometry(200, 200, 900, 600)
 
+        # Track the currently selected file path in memory
+        self.current_file: str | None = None
+
         # --- Central Label ---
         # Placeholder until I add real UI elements.
-        self.label = QLabel(
-            "Welcome to Aura Clip\n\nUse the menu to Import, Detect, or Export."
-        )
+        msg = "Welcome to Aura Clip\n\nUse the menu to Import, Detect, or Export."
+        if not MOVIEPY_AVAILABLE:  
+            msg += (
+                "\n\n(MoviePy not detected. Install with:\n"
+                "  python -m pip install moviepy imageio imageio-ffmpeg numpy)"
+            )
+        self.label = QLabel(msg)
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setCentralWidget(self.label)
+
+        if not MOVIEPY_AVAILABLE:  
+            msg += (
+                "\n\n(MoviePy not detected. Install with:\n"
+                "  python -m pip install moviepy imageio imageio-ffmpeg numpy)"
+            )
 
         # --- Status Bar ---
         # Displays messages to the user, such as file loaded or task complete.
@@ -68,11 +78,16 @@ class AuraClipApp(QMainWindow):
 
         # Tools Menu (Detect / Export)
         tools_menu = menubar.addMenu("Tools")
-        detect_action = tools_menu.addAction("Detect Scenes")
-        detect_action.triggered.connect(self.detect_scenes)
 
-        export_action = tools_menu.addAction("Export Clips")
-        export_action.triggered.connect(self.export_clips)
+        self.detect_action = tools_menu.addAction("Detect Scenes")
+        self.detect_action.triggered.connect(self.detect_scenes)
+
+        self.export_action = tools_menu.addAction("Export Clips")
+        self.export_action.triggered.connect(self.export_clips)
+
+         # Disabled at startup until a file is loaded
+        self.detect_action.setEnabled(False)                        
+        self.export_action.setEnabled(False)                        
 
         # Settings Menu
         settings_menu = menubar.addMenu("Settings")
@@ -86,19 +101,66 @@ class AuraClipApp(QMainWindow):
 
         print("Aura Clip initialized successfully.")
 
-    # --- Placeholder Actions ---
+    # Small helper to enable/disable both actions at once
+    def set_actions_enabled(self, loaded: bool) -> None:
+        self.detect_action.setEnabled(loaded) 
+        self.export_action.setEnabled(loaded)  
+
+    # small helper to extract media info with MoviePy
+    # use namespaced class mp.VideoFileClip so the name always exists
+    def get_media_info(self, file_path: str) -> dict:  
+        """
+        Return a dict with duration (s), fps, and resolution (w, h).
+        MoviePy opens the file briefly to read metadata.
+        """
+
+        if not MOVIEPY_AVAILABLE:  
+            return {"duration": 0.0, "fps": 0.0, "width": 0, "height": 0}
+
+        try:
+            with mp.VideoFileClip(file_path) as clip:
+                duration = float(clip.duration) if clip.duration else 0.0
+                fps = float(clip.fps) if clip.fps else 0.0
+                w, h = clip.size if clip.size else (0, 0)
+            return {"duration": duration, "fps": fps, "width": w, "height": h}
+        except Exception as e:
+            # Keep it simple for now: show an error message and return empty info.
+            QMessageBox.critical(self, "Media Error", f"Could not read media info:\n{e}")
+            return {"duration": 0.0, "fps": 0.0, "width": 0, "height": 0}    
+
+    # --- Actions ---
 
     def import_video(self):
         # Open a file dialog to select a local video file.
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Video File", "", "Video Files (*.mp4 *.mov *.mkv *.avi)"
         )
-        if file_path:
-            self.status.showMessage(f"Imported: {os.path.basename(file_path)}", 5000)
-            self.label.setText(f"Loaded file:\n{file_path}")
-            print(f"Imported video: {file_path}")
-        else:
-            print("Import canceled by user.")
+        if not file_path:  # early-return on cancel
+            self.status.showMessage("Import canceled.", 3000)  
+            self.set_actions_enabled(False)                    
+            return
+        
+        # Record file and read media info
+        self.current_file = file_path  
+        info = self.get_media_info(file_path)  
+
+        # Format a friendly display, rounding values for readability
+        duration_s = round(info["duration"], 2)  
+        fps = round(info["fps"], 2)              
+        w, h = info["width"], info["height"]     
+
+        # Update UI with file + metadata
+        basename = os.path.basename(file_path)  
+        self.label.setText(                    
+            f"Loaded file:\n{basename}\n\n"
+            f"Duration: {duration_s}s\n"
+            f"FPS: {fps}\n"
+            f"Resolution: {w} x {h}"
+        )
+        self.status.showMessage(f"Imported: {basename}", 5000)  
+
+        # enable Detect/Export now that a file is loaded
+        self.set_actions_enabled(True)
 
     def detect_scenes(self):
         # Placeholder for scene detection logic.
@@ -108,11 +170,18 @@ class AuraClipApp(QMainWindow):
         print("Detect Scenes clicked (placeholder).")
 
     def export_clips(self):
-        # Placeholder for export logic.
+        if not self.current_file:
+            self.set_actions_enabled(False)
+            QMessageBox.information(
+                self, 
+                "Export Clips", 
+                "Please import a video first so I know what to export."
+            )
+            return
+        
         QMessageBox.information(
             self, "Export Clips", "Export functionality will be added later!"
         )
-        print("Export Clips clicked (placeholder).")
 
     def open_settings(self):
         # Placeholder for app settings dialog.
