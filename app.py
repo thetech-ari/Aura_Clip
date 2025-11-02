@@ -7,24 +7,18 @@ Aura Clip - Base Application Window
 # Import QApplication and QMainWindow to create the base window.
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QApplication,
-    QMainWindow,
-    QLabel,
-    QStatusBar,
-    QMenuBar,
-    QFileDialog,
-    QMessageBox,
-    QWidget,
-    QHBoxLayout,
-    QListWidget,        
-    QListWidgetItem,
+    QApplication, QMainWindow, QLabel, QStatusBar, QMenuBar,
+    QFileDialog, QMessageBox, QWidget, QHBoxLayout,
+    QListWidget, QListWidgetItem,
 )
 import sys
 import os
+import subprocess
+import shlex
 
+# Importing scenedetect safely
 SCENEDETECT_AVAILABLE = False            
 SCENEDETECT_API = None  
-# Importing scenedetect safely
 try:
     # v0.6+ API
     from scenedetect import SceneManager, open_video        
@@ -42,13 +36,20 @@ except Exception:
         # Leave SCENEDETECT_AVAILABLE=False / SCENEDETECT_API=None
         pass          
 
-# import VideoFileClip the moviepy package as a namespace and detect availability
+# import/export VideoFileClip the moviepy package as a namespace and detect availability
 try:
     from moviepy.video.io.VideoFileClip import VideoFileClip              
     MOVIEPY_AVAILABLE = True 
 except Exception:
     VideoFileClip = None                          
-    MOVIEPY_AVAILABLE = False          
+    MOVIEPY_AVAILABLE = False      
+
+# ensure ffmpeg binary is known to MoviePy/tools
+import imageio_ffmpeg
+FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+os.environ["IMAGEIO_FFMPEG_EXE"] = FFMPEG_EXE
+
+
 
 class AuraClipApp(QMainWindow):
     
@@ -77,7 +78,7 @@ class AuraClipApp(QMainWindow):
 
         # Right side = scene list instead of just a message label
         self.scene_list = QListWidget(self.container)           
-        self.scene_list.setFixedWidth(300)                  
+        self.scene_list.setFixedWidth(350)                  
         self.layout.addWidget(self.scene_list)                 
          
 
@@ -252,12 +253,16 @@ class AuraClipApp(QMainWindow):
                 self.status.showMessage("No scenes found.", 4000)
                 return
 
-            # Populate list with readable timecodes
+            # Populate list with readable timecodes + 
+            # checkable scene items and store(start_s, end_s)
             for i, (start, end) in enumerate(scenes, start=1):
                 start_s = start.get_seconds()
                 end_s = end.get_seconds()
                 item_text = f"Scene {i}: {start_s:.2f}s → {end_s:.2f}s"
-                self.scene_list.addItem(QListWidgetItem(item_text))
+                item = QListWidgetItem(item_text)
+                item.setCheckState(Qt.CheckState.Checked)                
+                item.setData(Qt.ItemDataRole.UserRole, (start_s, end_s))  
+                self.scene_list.addItem(item)
 
             self.status.showMessage(f"Detected {len(scenes)} scenes.", 5000)
             self.main_label.setText("Scenes detected! Review them on the right panel.")
@@ -266,19 +271,135 @@ class AuraClipApp(QMainWindow):
             QMessageBox.critical(self, "Detection Error", f"Failed to detect scenes:\n{e}")
             self.status.showMessage("Scene detection failed.", 5000)
 
+    # helper to call ffmpeg directly and bubble up stderr if it fails
+    def _run_ffmpeg_slice(self, src: str, start_s: float, end_s: float, dst: str) -> tuple[bool, str]:
+        """
+        Uses the verified ffmpeg binary to cut [start_s, end_s] into dst.
+        Returns (ok, stderr_text).
+        """
+        # Build the command: seek BEFORE input for speed, then -to absolute time.
+        ffmpeg_bin = os.environ.get("IMAGEIO_FFMPEG_EXE") or "ffmpeg"
+        cmd = [
+            ffmpeg_bin,
+            "-y",                         # overwrite without asking
+            "-loglevel", "error",         # only errors on stderr
+            "-ss", f"{start_s:.3f}",
+            "-to", f"{end_s:.3f}",
+            "-i", src,
+            "-c:v", "libx264",
+            "-c:a", "aac",
+            dst,
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            ok = (proc.returncode == 0) and os.path.exists(dst) and os.path.getsize(dst) > 0
+            return ok, (proc.stderr or "").strip()
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
     def export_clips(self):
+        # Export all checked detected scenes to exports as MP4 clips using ffmpeg
         if not self.current_file:
             self.set_actions_enabled(False)
             QMessageBox.information(
-                self, 
-                "Export Clips", 
+                self, "Export Clips",
                 "Please import a video first so I know what to export."
             )
             return
+
+        if not self.current_scenes or self.scene_list.count() == 0:
+            QMessageBox.information(self, "Export Clips", "No detected scenes found. Run detection first.")
+            return
         
-        QMessageBox.information(
-            self, "Export Clips", "Export functionality will be added later!"
-        )
+        # verify ffmpeg runs (uses imageio-ffmpeg’s binary if set)
+        ffmpeg_bin = os.environ.get("IMAGEIO_FFMPEG_EXE") or "ffmpeg" 
+        try:                                                          
+            probe = subprocess.run([ffmpeg_bin, "-version"], capture_output=True, text=True)
+            if probe.returncode != 0:
+                raise RuntimeError("ffmpeg not runnable")
+        except Exception:
+            QMessageBox.critical(self, "Missing ffmpeg", "ffmpeg is not runnable. Reinstall imageio-ffmpeg or system ffmpeg.")
+            return
+
+        # Gather only the checked items
+        selections = []  # (idx, start_s, end_s)  
+        for idx in range(self.scene_list.count()):                                        
+            item = self.scene_list.item(idx)                                              
+            if item.checkState() == Qt.CheckState.Checked:                                
+                start_s, end_s = item.data(Qt.ItemDataRole.UserRole)                     
+                if (end_s - start_s) > 0.05:  # tiny guard for 0-length clips   
+                    selections.append((idx, start_s, end_s))                               
+
+        if not selections:                                                               
+            QMessageBox.information(self, "Export Clips", "No scenes selected to export.")
+            return     
+
+        # clamp times into media duration to avoid out-of-range writes
+        info = self.get_media_info(self.current_file)                  
+        duration = float(info.get("duration", 0.0)) if info else 0.0   
+        if duration <= 0.05:                                            
+            QMessageBox.critical(self, "Export Clips", "Invalid media duration; cannot export.")  
+            return                                                     
+
+        clamped = [] 
+        for idx, s, e in selections:                                   
+            s2 = max(0.0, min(s, duration))                            
+            e2 = max(0.0, min(e, duration))                             
+            if e2 - s2 > 0.05:                                          
+                clamped.append((idx, s2, e2))                          
+        if not clamped:                                                 
+            QMessageBox.information(self, "Export Clips", "Nothing to export after clamping times.") 
+            return              
+
+        self.status.showMessage("Exporting clips... please wait.")
+        QApplication.processEvents()
+
+        basename = os.path.splitext(os.path.basename(self.current_file))[0]
+        export_dir = os.path.join(os.getcwd(), "exports")
+        os.makedirs(export_dir, exist_ok=True)
+
+        # check write permission before attempting
+        if not os.access(export_dir, os.W_OK):                        
+            QMessageBox.critical(self, "Export Clips", f"No write permission to:\n{export_dir}")  
+            return                                           
+
+        exported = 0
+        errors = []
+
+        for n, (idx, start_s, end_s) in enumerate(clamped, start=1): 
+            out_path = os.path.join(export_dir, f"{basename}_scene_{n:02d}.mp4")
+            ok, err = self._run_ffmpeg_slice(self.current_file, start_s, end_s, out_path)
+            if ok:
+                self.scene_list.item(idx).setText(                    
+                    f"Exported Scene {n}: {start_s:.2f}s → {end_s:.2f}s"
+                )
+                exported += 1
+            else:
+                errors.append((n, start_s, end_s, err))  
+
+        if exported > 0 and not errors:
+            self.status.showMessage(f"Exported {exported} clip(s).", 6000)
+            QMessageBox.information(self, "Export Complete", f"Exported {exported} scene(s) to:\n{export_dir}")
+        elif exported > 0 and errors:
+            n, s, e, err = errors[0]                                  
+            self.status.showMessage(f"Exported {exported} clip(s), {len(errors)} failed.", 8000)
+            QMessageBox.warning( 
+                self,  
+                "Export Partially Complete",
+                f"Exported {exported} clip(s), {len(errors)} failed.\n"
+                f"First failure (Scene {n} {s:.2f}s→{e:.2f}s):\n{err or '(no stderr)'}"
+                )
+        else:
+            # show the actual ffmpeg stderr to make debugging easy
+            hint = errors[0][3] if errors else "ffmpeg returned a non-zero code." 
+            QMessageBox.critical(                                                  
+                self,
+                "Export Error",
+                "No clips were exported.\n\n"
+                f"ffmpeg stderr (first failure):\n{hint or '(no stderr)'}\n\n"
+                f"Check write perms for:\n{export_dir}"
+            )
+            self.status.showMessage("Export failed.", 5000)
 
     def open_settings(self):
         # Placeholder for app settings dialog.
@@ -293,7 +414,7 @@ class AuraClipApp(QMainWindow):
             self,
             "About Aura Clip",
             "Aura Clip (PP4 R&D Build)\n\n"
-            "Developed by Arianna Miller (Full Sail University)\n"
+            "Developed by Arianna Miller-Paul (Full Sail University)\n"
             "This app demonstrates the integration of PyQt6 + MoviePy + PySceneDetect."
         )
         print("Displayed About dialog.")
