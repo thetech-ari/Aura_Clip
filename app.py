@@ -16,10 +16,31 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QWidget,
     QHBoxLayout,
+    QListWidget,        
+    QListWidgetItem,
 )
 import sys
 import os
 
+SCENEDETECT_AVAILABLE = False              # ✅ FIX
+SCENEDETECT_API = None  
+# Importing scenedetect safely
+try:
+    # v0.6+ API
+    from scenedetect import SceneManager, open_video        # ✅ FIX
+    from scenedetect.detectors import ContentDetector       # ✅ FIX
+    SCENEDETECT_AVAILABLE = True                            # ✅ FIX
+    SCENEDETECT_API = "v0.6+"                               # ✅ FIX
+except Exception:
+    try:
+        # v0.5.x Legacy API
+        from scenedetect import VideoManager, SceneManager  # ✅ FIX
+        from scenedetect.detectors import ContentDetector   # ✅ FIX
+        SCENEDETECT_AVAILABLE = True                        # ✅ FIX
+        SCENEDETECT_API = "v0.5"                            # ✅ FIX
+    except Exception:
+        # Leave SCENEDETECT_AVAILABLE=False / SCENEDETECT_API=None
+        pass          
 
 # import VideoFileClip the moviepy package as a namespace and detect availability
 try:
@@ -40,6 +61,7 @@ class AuraClipApp(QMainWindow):
 
         # Track the currently selected file path in memory
         self.current_file: str | None = None
+        self.current_scenes: list | None = None
 
          # Create a main container widget with horizontal layout
         self.container = QWidget(self)                      
@@ -51,21 +73,19 @@ class AuraClipApp(QMainWindow):
         self.info_label = QLabel("No file loaded.", self.container) 
         self.info_label.setAlignment(Qt.AlignmentFlag.AlignTop)  
         self.info_label.setFixedWidth(260)        
-        self.layout.addWidget(self.info_label)          
+        self.layout.addWidget(self.info_label) 
+
+        # Right side = scene list instead of just a message label
+        self.scene_list = QListWidget(self.container)           
+        self.scene_list.setFixedWidth(300)                  
+        self.layout.addWidget(self.scene_list)                 
+         
 
         # --- Central Label ---
-        # Placeholder until I add real UI elements.
-        msg = "Welcome to Aura Clip\n\nUse the menu to Import, Detect, or Export."
-       
-        if not MOVIEPY_AVAILABLE:  
-            msg += (
-                "\n\n(MoviePy not detected. Install with:\n"
-                "  python -m pip install moviepy imageio imageio-ffmpeg numpy)"
-            )
-
-        self.main_label = QLabel(msg, self.container)
+        # central message label in between 
+        self.main_label = QLabel("Welcome to Aura Clip\n\nUse the menu to Import, Detect, or Export.")
         self.main_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.layout.addWidget(self.main_label, stretch=1)
+        self.layout.insertWidget(1, self.main_label, stretch=1)
 
         # --- Status Bar ---
         # Displays messages to the user, such as file loaded or task complete.
@@ -179,17 +199,72 @@ class AuraClipApp(QMainWindow):
             "Next: choose 'Tools > Detect Scenes' to test detection."
         )
 
+        self.scene_list.clear() # to clear previous detections
         self.status.showMessage(f"Imported: {basename}", 5000)  
 
         # enable Detect/Export now that a file is loaded
         self.set_actions_enabled(True)
 
+    # Scene detection implementation
     def detect_scenes(self):
-        # Placeholder for scene detection logic.
-        QMessageBox.information(
-            self, "Detect Scenes", "Scene detection will be added soon!"
-        )
-        print("Detect Scenes clicked (placeholder).")
+        # Run PySceneDetect and populate the scene list (will support v0.6+ and v0.5.x).
+        if not self.current_file:
+            QMessageBox.information(self, "No File", "Please import a video first.")
+            return
+        if not SCENEDETECT_AVAILABLE:
+            QMessageBox.critical(
+                self, "Missing Library",
+                "PySceneDetect not available.\nInstall with:\n  pip install scenedetect"
+            )
+            return
+
+        self.status.showMessage("Detecting scenes... please wait.")
+        QApplication.processEvents()    # keep UI responsive
+
+        try:
+            # --- Run detection for the appropriate API ---
+            if SCENEDETECT_API == "v0.6+":
+                video = open_video(self.current_file)          # v0.6+ path
+                scene_manager = SceneManager()
+                scene_manager.add_detector(ContentDetector(threshold=27.0))
+                scene_manager.detect_scenes(video)
+                scenes = scene_manager.get_scene_list()
+
+            elif SCENEDETECT_API == "v0.5":
+                video_manager = VideoManager([self.current_file])   # v0.5 path
+                scene_manager = SceneManager()
+                scene_manager.add_detector(ContentDetector(threshold=27.0))
+                video_manager.set_downscale_factor()
+                video_manager.start()
+                scene_manager.detect_scenes(frame_source=video_manager)
+                scenes = scene_manager.get_scene_list()
+                video_manager.release()
+
+            else:
+                raise RuntimeError("Unsupported PySceneDetect API version.")
+
+            # --- Update UI list ---
+            self.current_scenes = scenes
+            self.scene_list.clear()
+
+            if not scenes:
+                self.scene_list.addItem("No scenes detected.")
+                self.status.showMessage("No scenes found.", 4000)
+                return
+
+            # Populate list with readable timecodes
+            for i, (start, end) in enumerate(scenes, start=1):
+                start_s = start.get_seconds()
+                end_s = end.get_seconds()
+                item_text = f"Scene {i}: {start_s:.2f}s → {end_s:.2f}s"
+                self.scene_list.addItem(QListWidgetItem(item_text))
+
+            self.status.showMessage(f"Detected {len(scenes)} scenes.", 5000)
+            self.main_label.setText("Scenes detected! Review them on the right panel.")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Detection Error", f"Failed to detect scenes:\n{e}")
+            self.status.showMessage("Scene detection failed.", 5000)
 
     def export_clips(self):
         if not self.current_file:
