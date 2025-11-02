@@ -14,16 +14,19 @@ from PyQt6.QtWidgets import (
     QMenuBar,
     QFileDialog,
     QMessageBox,
+    QWidget,
+    QHBoxLayout,
 )
 import sys
 import os
 
-# import the moviepy package as a namespace and detect availability
+
+# import VideoFileClip the moviepy package as a namespace and detect availability
 try:
-    import moviepy as mp               
-    MOVIEPY_AVAILABLE = hasattr(mp, "VideoFileClip")  
+    from moviepy.video.io.VideoFileClip import VideoFileClip              
+    MOVIEPY_AVAILABLE = True 
 except Exception:
-    mp = None                          
+    VideoFileClip = None                          
     MOVIEPY_AVAILABLE = False          
 
 class AuraClipApp(QMainWindow):
@@ -38,32 +41,40 @@ class AuraClipApp(QMainWindow):
         # Track the currently selected file path in memory
         self.current_file: str | None = None
 
+         # Create a main container widget with horizontal layout
+        self.container = QWidget(self)                      
+        self.layout = QHBoxLayout(self.container)                    
+        self.container.setLayout(self.layout)                  
+        self.setCentralWidget(self.container)           
+
+        # Create a left info panel (QLabel)
+        self.info_label = QLabel("No file loaded.", self.container) 
+        self.info_label.setAlignment(Qt.AlignmentFlag.AlignTop)  
+        self.info_label.setFixedWidth(260)        
+        self.layout.addWidget(self.info_label)          
+
         # --- Central Label ---
         # Placeholder until I add real UI elements.
         msg = "Welcome to Aura Clip\n\nUse the menu to Import, Detect, or Export."
+       
         if not MOVIEPY_AVAILABLE:  
             msg += (
                 "\n\n(MoviePy not detected. Install with:\n"
                 "  python -m pip install moviepy imageio imageio-ffmpeg numpy)"
             )
-        self.label = QLabel(msg)
-        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setCentralWidget(self.label)
 
-        if not MOVIEPY_AVAILABLE:  
-            msg += (
-                "\n\n(MoviePy not detected. Install with:\n"
-                "  python -m pip install moviepy imageio imageio-ffmpeg numpy)"
-            )
+        self.main_label = QLabel(msg, self.container)
+        self.main_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.layout.addWidget(self.main_label, stretch=1)
 
         # --- Status Bar ---
         # Displays messages to the user, such as file loaded or task complete.
-        self.status = QStatusBar()
+        self.status = QStatusBar(self)
         self.setStatusBar(self.status)
 
         # --- Menu Bar ---
         # The menu bar gives us structured access to actions.
-        menubar = QMenuBar()
+        menubar = QMenuBar(self)
         self.setMenuBar(menubar)
 
         # File Menu (Import + Exit)
@@ -117,8 +128,12 @@ class AuraClipApp(QMainWindow):
         if not MOVIEPY_AVAILABLE:  
             return {"duration": 0.0, "fps": 0.0, "width": 0, "height": 0}
 
+        if not os.path.exists(file_path):                    
+            QMessageBox.critical(self, "Media Error", "File does not exist.")  
+            return {"duration": 0.0, "fps": 0.0, "width": 0, "height": 0} 
+
         try:
-            with mp.VideoFileClip(file_path) as clip:
+            with VideoFileClip(file_path, audio=False) as clip:
                 duration = float(clip.duration) if clip.duration else 0.0
                 fps = float(clip.fps) if clip.fps else 0.0
                 w, h = clip.size if clip.size else (0, 0)
@@ -151,12 +166,19 @@ class AuraClipApp(QMainWindow):
 
         # Update UI with file + metadata
         basename = os.path.basename(file_path)  
-        self.label.setText(                    
+        self.info_label.setText(                    
             f"Loaded file:\n{basename}\n\n"
             f"Duration: {duration_s}s\n"
             f"FPS: {fps}\n"
             f"Resolution: {w} x {h}"
         )
+
+        # Show a friendlier message on the right
+        self.main_label.setText(                            
+            "Video loaded successfully.\n\n"
+            "Next: choose 'Tools > Detect Scenes' to test detection."
+        )
+
         self.status.showMessage(f"Imported: {basename}", 5000)  
 
         # enable Detect/Export now that a file is loaded
