@@ -22,22 +22,22 @@ from PyQt6.QtWidgets import (
 import sys
 import os
 
-SCENEDETECT_AVAILABLE = False              # ✅ FIX
+SCENEDETECT_AVAILABLE = False            
 SCENEDETECT_API = None  
 # Importing scenedetect safely
 try:
     # v0.6+ API
-    from scenedetect import SceneManager, open_video        # ✅ FIX
-    from scenedetect.detectors import ContentDetector       # ✅ FIX
-    SCENEDETECT_AVAILABLE = True                            # ✅ FIX
-    SCENEDETECT_API = "v0.6+"                               # ✅ FIX
+    from scenedetect import SceneManager, open_video        
+    from scenedetect.detectors import ContentDetector      
+    SCENEDETECT_AVAILABLE = True                           
+    SCENEDETECT_API = "v0.6+"                              
 except Exception:
     try:
         # v0.5.x Legacy API
-        from scenedetect import VideoManager, SceneManager  # ✅ FIX
-        from scenedetect.detectors import ContentDetector   # ✅ FIX
-        SCENEDETECT_AVAILABLE = True                        # ✅ FIX
-        SCENEDETECT_API = "v0.5"                            # ✅ FIX
+        from scenedetect import VideoManager, SceneManager  
+        from scenedetect.detectors import ContentDetector  
+        SCENEDETECT_AVAILABLE = True                        
+        SCENEDETECT_API = "v0.5"                            
     except Exception:
         # Leave SCENEDETECT_AVAILABLE=False / SCENEDETECT_API=None
         pass          
