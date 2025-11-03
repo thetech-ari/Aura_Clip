@@ -1,23 +1,33 @@
+"""
+Aura Clip (PP4 R&D Build)
+-------------------------
+Week-1 Project base with end-to-end tech stack:
+
+- UI: PyQt6 (menus, status, list view, preview player)
+- Detection: PySceneDetect (supports v0.6+ and legacy v0.5 API)
+- Metadata: MoviePy (read-only probe for duration / fps / size)
+- Export: ffmpeg (via imageio-ffmpeg binary; direct subprocess calls)
+
+User flow:
+  Import → Detect → (Select scenes) → Export
+Plus: preview player with play/pause, ±/-5s, seek; click scene to seek; double-click to play.
+"""
 
 # -------- Aura Clip - Base Application Window -------
 
 # Third-party libraries & Qt widgets used to build the UI
 # PyQt6 drives the desktop UI to create the base window.
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QStatusBar, QMenuBar,
     QFileDialog, QMessageBox, QWidget, QHBoxLayout,
-    QListWidget, QListWidgetItem,
+    QListWidget, QListWidgetItem, QPushButton, QSlider, QStyle,
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
-from PyQt6.QtWidgets import QPushButton, QSlider, QStyle
-from PyQt6.QtCore import QUrl
 
 # --- Standard Library ---
-import sys
-import os
-import subprocess
+import sys, os, subprocess
 
 # --- Scene detection (PySceneDetect) ---
 # Importing scenedetect safely
@@ -32,7 +42,7 @@ try:
     SCENEDETECT_API = "v0.6+"                              
 except Exception:
     try:
-        # v0.5 Legacy API
+        # v0.5.x API
         from scenedetect import VideoManager, SceneManager  
         from scenedetect.detectors import ContentDetector  
         SCENEDETECT_AVAILABLE = True                        
@@ -41,7 +51,7 @@ except Exception:
         pass    # remains unavailable; UI will show a friendly message      
 
 # Lightweight MoviePy import for read only metadata; 
-# VideoFileClip is only needed to read duration/fps/size, no writing
+# (VideoFileClip is only needed to read duration/fps/size, no writing)
 try:
     from moviepy.video.io.VideoFileClip import VideoFileClip              
     MOVIEPY_AVAILABLE = True 
@@ -50,7 +60,7 @@ except Exception:
     MOVIEPY_AVAILABLE = False      
 
 # --- FFmpeg Setup (for exporting clips) ---
-# ensures ffmpeg binary is known to MoviePy/imageio tools
+# ensures ffmpeg binary is known to MoviePy/imageio tools so they use the same executable
 import imageio_ffmpeg
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 os.environ["IMAGEIO_FFMPEG_EXE"] = FFMPEG_EXE
@@ -72,8 +82,8 @@ class AuraClipApp(QMainWindow):
 
         # --- Main content area ---
         """ 
-            [Left]  Video preview panel + file metadata 
-            [Bottom]Transport Bar (video playback buttons and slider)
+            [Left-Top] Video preview panel + file metadata 
+            [Left-Bottom]Transport Bar (video playback buttons and slider)
             [Right] Checkable scene list (one row per detected segment) 
         """
         # preview + info + scenes
@@ -81,7 +91,7 @@ class AuraClipApp(QMainWindow):
         self.layout = QHBoxLayout(self.container)
         self.setCentralWidget(self.container)           
 
-        # Left: video preview (top) + info (bottom) + transport (bottom)
+        # Left: video preview (top) + info (middle) + transport (bottom)
         left = QWidget(self.container)
         from PyQt6.QtWidgets import QVBoxLayout, QGridLayout
         left_v = QVBoxLayout(left)
@@ -168,6 +178,8 @@ class AuraClipApp(QMainWindow):
         print("Aura Clip initialized successfully.")
 
         # Media player setup
+        # Media is set to the preview; audio routed via QAudioOutput + 
+        # keep our own cached duration in milliseconds to map the seek slider.
         self.player = QMediaPlayer(self)
         self.audio = QAudioOutput(self)
         self.player.setAudioOutput(self.audio)
@@ -205,7 +217,7 @@ class AuraClipApp(QMainWindow):
         - Uses MoviePy's VideoFileClip in a context manager with audio disabled
           to avoid opening an audio device. Will close immediately after reading.
         - If MoviePy isn't available or probing fails, will return zeros and show
-          a user-friendly error (the app remains usable).
+          an error to avoid a crash.
         """
 
         if not MOVIEPY_AVAILABLE:  
@@ -222,7 +234,7 @@ class AuraClipApp(QMainWindow):
                 w, h = clip.size if clip.size else (0, 0)
             return {"duration": duration, "fps": fps, "width": w, "height": h}
         except Exception as e:
-            # Keeping it simple for now: show an error message and return empty info.
+            # show an error message and return empty info
             QMessageBox.critical(self, "Media Error", f"Could not read media info:\n{e}")
             return {"duration": 0.0, "fps": 0.0, "width": 0, "height": 0}    
 
@@ -246,7 +258,7 @@ class AuraClipApp(QMainWindow):
         self.player.pause()
         self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))  
 
-        # Format a friendly display, rounding values for readability
+        # Format a user-friendly display, rounding values for readability
         duration_s = round(info["duration"], 2)  
         fps = round(info["fps"], 2)              
         w, h = info["width"], info["height"]     
@@ -271,7 +283,8 @@ class AuraClipApp(QMainWindow):
 
     # Scene detection implementation
     def detect_scenes(self):
-        # Run PySceneDetect and populate the scene list (will support v0.6 and v0.5).
+        # Run PySceneDetect and populate the scene list(will support v0.6 and v0.5)
+        # Run PySceneDetect and populate the scene list 
 
         if not self.current_file:
             QMessageBox.information(self, "No File", "Please import a video first.")
@@ -284,7 +297,7 @@ class AuraClipApp(QMainWindow):
             return
 
         self.status.showMessage("Detecting scenes... please wait.")
-        QApplication.processEvents()    # keep UI responsive
+        QApplication.processEvents()    # keep UI responsive during detection
 
         try:
             # --- Run detection for the appropriate API ---
@@ -360,7 +373,8 @@ class AuraClipApp(QMainWindow):
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
 
-    # transport helpers
+    # --- Transport helpers ---
+    # Play/pause the preview and keep the button icon in sync
     def _toggle_play_pause(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
@@ -369,19 +383,23 @@ class AuraClipApp(QMainWindow):
             self.player.play()
             self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
 
+    # Step the playhead by ±N seconds, clamped to [0, duration]
     def _nudge(self, delta_sec: float):
         pos = max(0, min(self.player.position() + int(delta_sec * 1000), self._media_duration_ms))
         self.player.setPosition(pos)
 
+    # Map slider range [0..1000] to [0..duration_ms] and seek
     def _seek_to_ratio(self, val: int):
         # slider 0..1000 → position 0..duration
         if self._media_duration_ms > 0:
             target = int((val / 1000.0) * self._media_duration_ms)
             self.player.setPosition(target)
 
+    # Cache media duration (ms) for consistent slider math
     def _on_duration(self, dur_ms: int):
         self._media_duration_ms = max(0, dur_ms)
 
+    # Update slider to reflect current playback position (no feedback loop)
     def _on_position(self, pos_ms: int):
         # keep slider synced with playback
         if self._media_duration_ms > 0:
@@ -390,7 +408,8 @@ class AuraClipApp(QMainWindow):
             self.seek.setValue(int(ratio * 1000))
             self.seek.blockSignals(False)
 
-    # seek to a scene's start on single click (don't autoplay)
+# -- Scene List Click Handlers --
+    # single click: seek to a scene's start on  (don't autoplay)
     def _jump_to_scene_start(self, item):
         data = item.data(Qt.ItemDataRole.UserRole)
         if not data:
@@ -404,7 +423,7 @@ class AuraClipApp(QMainWindow):
         self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         self.status.showMessage(f"Jumped to {start_s:.2f}s.", 2000)
 
-    # seek & play on double click
+    # double click: seek & play on 
     def _play_from_scene_start(self, item):
         data = item.data(Qt.ItemDataRole.UserRole)
         if not data:
@@ -418,12 +437,26 @@ class AuraClipApp(QMainWindow):
 
 
     def export_clips(self):
-        # Export all checked detected scenes to exports as MP4 clips using ffmpeg
+        """
+            Export all CHECKED scenes to ./exports as MP4 using ffmpeg
+
+            Pipeline / why each step exists:
+            1) Preconditions: ensure a file is loaded and scenes exist
+            2) Tool sanity: confirm ffmpeg is runnable 
+            3) Selection: collect ONLY checked rows; skip ~0s segments
+            4) Safety: clamp (start,end) to the media duration to avoid out-of-range/OOB writes
+            5) IO prep: create ./exports and verify we can write there
+            6) Work: for each segment, run ffmpeg and update the list row text
+            7) UX summary: success, partial success (show first stderr), or failure
+        """
+        
+        # --- 1) Preconditions
         if not self.current_file:
             self.set_actions_enabled(False)
             QMessageBox.information(
-                self, "Export Clips",
-                "Please import a video first so I know what to export."
+                self, 
+                "Export Clips",
+                "Please import a video first to export."
             )
             return
 
@@ -431,7 +464,7 @@ class AuraClipApp(QMainWindow):
             QMessageBox.information(self, "Export Clips", "No detected scenes found. Run detection first.")
             return
         
-        # verify ffmpeg runs (uses imageio-ffmpeg’s binary if set)
+        # --- 2) Tool sanity
         ffmpeg_bin = os.environ.get("IMAGEIO_FFMPEG_EXE") or "ffmpeg" 
         try:                                                          
             probe = subprocess.run([ffmpeg_bin, "-version"], capture_output=True, text=True)
@@ -441,20 +474,20 @@ class AuraClipApp(QMainWindow):
             QMessageBox.critical(self, "Missing ffmpeg", "ffmpeg is not runnable. Reinstall imageio-ffmpeg or system ffmpeg.")
             return
 
-        # Gather only the checked items
+        # --- 3) Selection
         selections = []  # (idx, start_s, end_s)  
         for idx in range(self.scene_list.count()):                                        
             item = self.scene_list.item(idx)                                              
             if item.checkState() == Qt.CheckState.Checked:                                
                 start_s, end_s = item.data(Qt.ItemDataRole.UserRole)                     
-                if (end_s - start_s) > 0.05:  # tiny guard for 0-length clips   
+                if (end_s - start_s) > 0.05:    # Ignore tiny/zero-length slices to avoid writer errors and empty files.  
                     selections.append((idx, start_s, end_s))                               
 
         if not selections:                                                               
             QMessageBox.information(self, "Export Clips", "No scenes selected to export.")
             return     
 
-        # clamp times into media duration to avoid out-of-range writes
+        # --- 4) Safety
         info = self.get_media_info(self.current_file)                  
         duration = float(info.get("duration", 0.0)) if info else 0.0   
         if duration <= 0.05:                                            
@@ -471,6 +504,7 @@ class AuraClipApp(QMainWindow):
             QMessageBox.information(self, "Export Clips", "Nothing to export after clamping times.") 
             return              
 
+        # --- 5) IO prep
         self.status.showMessage("Exporting clips... please wait.")
         QApplication.processEvents()
 
@@ -483,20 +517,24 @@ class AuraClipApp(QMainWindow):
             QMessageBox.critical(self, "Export Clips", f"No write permission to:\n{export_dir}")  
             return                                           
 
+        # --- 6) Work
         exported = 0
-        errors = []
+        errors = []     # [(scene_number, start_s, end_s, stderr_text)]
 
         for n, (idx, start_s, end_s) in enumerate(clamped, start=1): 
             out_path = os.path.join(export_dir, f"{basename}_scene_{n:02d}.mp4")
             ok, err = self._run_ffmpeg_slice(self.current_file, start_s, end_s, out_path)
             if ok:
+                # Immediate per-row confirmation helps the user trust the export.
                 self.scene_list.item(idx).setText(                    
                     f"Exported Scene {n}: {start_s:.2f}s → {end_s:.2f}s"
                 )
                 exported += 1
             else:
+                # Keep enough context to display a helpful summary to the user.
                 errors.append((n, start_s, end_s, err))  
 
+        # --- 7) UX summary
         if exported > 0 and not errors:
             self.status.showMessage(f"Exported {exported} clip(s).", 6000)
             QMessageBox.information(self, "Export Complete", f"Exported {exported} scene(s) to:\n{export_dir}")
