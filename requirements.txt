@@ -1,19 +1,44 @@
-# --- GUI Framework ---
-PyQt6==6.7.1                 # Main desktop UI framework
-PyQt6-Qt6==6.7.3             # Underlying Qt runtime
-PyQt6-sip==13.7.0            # Required PyQt6 component
-
-# --- Video Analysis & Metadata ---
-scenedetect==0.6.3           # Scene boundary detection (PySceneDetect v0.6+)
-moviepy==1.0.3               # Video metadata and basic IO
-imageio-ffmpeg==0.5.1        # FFmpeg binary interface for MoviePy
-opencv-python==4.10.0.84     # Frame-level analysis or preview handling
-numpy==1.26.4                # Math & array handling
-
-# --- Utilities ---
-tqdm==4.66.4                 # Progress bars for long tasks
-pandas==2.2.3                # CSV / metadata handling (for later analytics)
-
-# --- Dev / Packaging ---
-black==24.4.2                # Code formatting
-isort==5.13.2                # Import sorting
+audioread==3.1.0
+certifi==2025.10.5
+cffi==2.0.0
+charset-normalizer==3.4.4
+click==8.2.1
+decorator==4.4.2
+idna==3.11
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+joblib==1.5.2
+lazy_loader==0.4
+librosa==0.11.0
+llvmlite==0.45.1
+moviepy==2.2.1
+msgpack==1.1.2
+numba==0.62.1
+numpy==2.2.6
+opencv-python==4.12.0.88
+packaging==25.0
+pandas==2.3.3
+pillow==10.4.0
+platformdirs==4.5.0
+pooch==1.8.2
+proglog==0.1.12
+pycparser==2.23
+pydub==0.25.1
+PyQt6==6.10.0
+PyQt6-Qt6==6.10.0
+PyQt6_sip==13.10.2
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.1
+pytz==2025.2
+requests==2.32.5
+scenedetect==0.6.7.1
+scikit-learn==1.7.2
+scipy==1.16.3
+six==1.17.0
+soundfile==0.13.1
+soxr==1.0.0
+threadpoolctl==3.6.0
+tqdm==4.67.1
+typing_extensions==4.15.0
+tzdata==2025.2
+urllib3==2.5.0
