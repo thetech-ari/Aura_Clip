@@ -73,7 +73,7 @@ class AuraClipApp(QMainWindow):
         super().__init__()
 
         # --- Window chrome & state ---
-        self.setWindowTitle("Aura Clip - Scene Detection R&D")
+        self.setWindowTitle("Aura Clip - Iteration 1")
         self.setGeometry(200, 200, 900, 600)
 
         # Track the currently selected file path + detected scenes in memory
@@ -259,7 +259,8 @@ class AuraClipApp(QMainWindow):
         self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))  
 
         # Format a user-friendly display, rounding values for readability
-        duration_s = round(info["duration"], 2)  
+        duration_s = round(info["duration"], 2)
+        duration_ts = self.format_time(duration_s)  # HH:MM:SS  
         fps = round(info["fps"], 2)              
         w, h = info["width"], info["height"]     
 
@@ -267,7 +268,7 @@ class AuraClipApp(QMainWindow):
         basename = os.path.basename(file_path)  
         self.info_label.setText(                    
             f"Loaded file:\n{basename}\n\n"
-            f"Duration: {duration_s}s\n"
+            f"Duration: {duration_ts}s\n"
             f"FPS: {fps}\n"
             f"Resolution: {w} x {h}"
         )
@@ -281,10 +282,38 @@ class AuraClipApp(QMainWindow):
         # enable Detect/Export now that a file is loaded
         self.set_actions_enabled(True)
 
+    def _to_seconds(self, tc) -> float:
+        # PySceneDetect timecodes (v0.5/v0.6) or floats to seconds
+        try:
+            return float(tc.get_seconds())
+        except Exception:
+            try:
+                # v0.6 VideoTimecode exposes get_seconds()
+                return float(tc)  # already numeric
+            except Exception:
+                return 0.0
+
+    def format_time(self, seconds: float) -> str:
+        """
+            Convert a float number of seconds to a human-friendly timestamp.
+            Returns HH:MM:SS (zero-padded), e.g., 00:03:07 for 187s.
+                - Clamps negatives to 0.
+            This is for *positions* in the media (scene starts/ends), not performance timing.
+        """
+        try:
+            s = max(0, int(round(float(seconds))))
+        except Exception: 
+            s = 0
+
+        h = s // 3600
+        m = (s % 3600) // 60
+        sec = s % 60
+
+        return f"{h:02d}:{m:02d}:{sec:02d}"
+
     # Scene detection implementation
     def detect_scenes(self):
         # Run PySceneDetect and populate the scene list(will support v0.6 and v0.5)
-        # Run PySceneDetect and populate the scene list 
 
         if not self.current_file:
             QMessageBox.information(self, "No File", "Please import a video first.")
@@ -330,12 +359,14 @@ class AuraClipApp(QMainWindow):
                 self.status.showMessage("No scenes found.", 4000)
                 return
 
-            # Populate list with readable timecodes + 
-            # checkable scene items and store(start_s, end_s)
+                # Populate list with readable timecodes + 
+                # checkable scene items and store(start_s, end_s)
             for i, (start, end) in enumerate(scenes, start=1):
-                start_s = start.get_seconds()
-                end_s = end.get_seconds()
-                item_text = f"Scene {i}: {start_s:.2f}s → {end_s:.2f}s"
+                start_s = self._to_seconds(start)                            
+                end_s   = self._to_seconds(end)
+                start_ts = self.format_time(start_s)
+                end_ts   = self.format_time(end_s)
+                item_text = f"Scene {i}: {start_ts} → {end_ts}"
                 item = QListWidgetItem(item_text)
                 item.setCheckState(Qt.CheckState.Unchecked)                
                 item.setData(Qt.ItemDataRole.UserRole, (start_s, end_s))  
@@ -528,7 +559,12 @@ class AuraClipApp(QMainWindow):
         # Loop uses the actual scene index (idx) instead of selection order       
         for (idx, start_s, end_s) in clamped:  
             scene_num = idx + 1     # 1-based scene number as shown in the UI
-            out_path = os.path.join(                                                    
+            
+            # Convert raw seconds to HH:MM:SS timestamps for display
+            start_ts = self.format_time(start_s)                                                
+            end_ts   = self.format_time(end_s)                                                  
+            
+            out_path = os.path.join(                                                  
                 export_dir, f"{basename}_scene_{scene_num:0{pad}d}.mp4"                    
                 )
             ok, err = self._run_ffmpeg_slice(self.current_file, start_s, end_s, out_path)
@@ -579,7 +615,7 @@ class AuraClipApp(QMainWindow):
         QMessageBox.information(
             self,
             "About Aura Clip",
-            "Aura Clip (PP4 R&D Build)\n\n"
+            "Aura Clip (PP4 Iteration 1 Build)\n\n"
             "Developed by Arianna Miller-Paul (Full Sail University)\n"
             "This app demonstrates the integration of PyQt6 + MoviePy + PySceneDetect."
         )
