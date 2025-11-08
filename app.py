@@ -443,7 +443,8 @@ class AuraClipApp(QMainWindow):
             Pipeline / why each step exists:
             1) Preconditions: ensure a file is loaded and scenes exist
             2) Tool sanity: confirm ffmpeg is runnable 
-            3) Selection: collect ONLY checked rows; skip ~0s segments
+            3) Selection: collect ONLY checked rows; skip ~0s segments; scene number given in detect 
+                stays the same during export to avoid user confusion
             4) Safety: clamp (start,end) to the media duration to avoid out-of-range/OOB writes
             5) IO prep: create ./exports and verify we can write there
             6) Work: for each segment, run ffmpeg and update the list row text
@@ -521,18 +522,25 @@ class AuraClipApp(QMainWindow):
         exported = 0
         errors = []     # [(scene_number, start_s, end_s, stderr_text)]
 
-        for n, (idx, start_s, end_s) in enumerate(clamped, start=1): 
-            out_path = os.path.join(export_dir, f"{basename}_scene_{n:02d}.mp4")
+        # cosmetic: pad width based on total scenes so filenames sort nicely even for long videos
+        pad = max(2, len(str(self.scene_list.count())))
+
+        # Loop uses the actual scene index (idx) instead of selection order       
+        for (idx, start_s, end_s) in clamped:  
+            scene_num = idx + 1     # 1-based scene number as shown in the UI
+            out_path = os.path.join(                                                    
+                export_dir, f"{basename}_scene_{scene_num:0{pad}d}.mp4"                    
+                )
             ok, err = self._run_ffmpeg_slice(self.current_file, start_s, end_s, out_path)
             if ok:
                 # Immediate per-row confirmation helps the user trust the export.
                 self.scene_list.item(idx).setText(                    
-                    f"Exported Scene {n}: {start_s:.2f}s → {end_s:.2f}s"
+                    f"Exported Scene {scene_num}: {start_s:.2f}s → {end_s:.2f}s"
                 )
                 exported += 1
             else:
                 # Keep enough context to display a helpful summary to the user.
-                errors.append((n, start_s, end_s, err))  
+                errors.append((scene_num, start_s, end_s, err))  
 
         # --- 7) UX summary
         if exported > 0 and not errors:
