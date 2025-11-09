@@ -27,7 +27,7 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
 # --- Standard Library ---
-import sys, os, subprocess
+import sys, os, subprocess, time
 
 # --- Scene detection (PySceneDetect) ---
 # Importing scenedetect safely
@@ -314,6 +314,15 @@ class AuraClipApp(QMainWindow):
     # Scene detection implementation
     def detect_scenes(self):
         # Run PySceneDetect and populate the scene list(will support v0.6 and v0.5)
+        """
+            Run PySceneDetect and populate the scene list while collecting
+            empirical performance data (timing + scene counts).
+
+            Displays:
+            - Number of scenes detected
+            - Detector threshold
+            - Elapsed time in milliseconds / seconds
+        """
 
         if not self.current_file:
             QMessageBox.information(self, "No File", "Please import a video first.")
@@ -329,18 +338,22 @@ class AuraClipApp(QMainWindow):
         QApplication.processEvents()    # keep UI responsive during detection
 
         try:
+            start_time = time.perf_counter()  # --- start timing ---
+
+            threshold = 27.0  # content detector threshold
+
             # --- Run detection for the appropriate API ---
             if SCENEDETECT_API == "v0.6+":
                 video = open_video(self.current_file)          # v0.6+ path
                 scene_manager = SceneManager()
-                scene_manager.add_detector(ContentDetector(threshold=27.0))
+                scene_manager.add_detector(ContentDetector(threshold=threshold))
                 scene_manager.detect_scenes(video)
                 scenes = scene_manager.get_scene_list()
 
             elif SCENEDETECT_API == "v0.5":
                 video_manager = VideoManager([self.current_file])   # v0.5 path
                 scene_manager = SceneManager()
-                scene_manager.add_detector(ContentDetector(threshold=27.0))
+                scene_manager.add_detector(ContentDetector(threshold=threshold))
                 video_manager.set_downscale_factor()
                 video_manager.start()
                 scene_manager.detect_scenes(frame_source=video_manager)
@@ -349,6 +362,9 @@ class AuraClipApp(QMainWindow):
 
             else:
                 raise RuntimeError("Unsupported PySceneDetect API version.")
+            
+            elapsed_s = time.perf_counter() - start_time
+            elapsed_ms = elapsed_s * 1000.0  # milliseconds
 
             # --- Update UI list ---
             self.current_scenes = scenes
@@ -356,7 +372,9 @@ class AuraClipApp(QMainWindow):
 
             if not scenes:
                 self.scene_list.addItem("No scenes detected.")
-                self.status.showMessage("No scenes found.", 4000)
+                msg = f"No scenes found | threshold={threshold} | elapsed={elapsed_ms:.1f} ms"
+                print(msg)
+                self.status.showMessage(msg, 6000)
                 return
 
                 # Populate list with readable timecodes + 
@@ -372,7 +390,18 @@ class AuraClipApp(QMainWindow):
                 item.setData(Qt.ItemDataRole.UserRole, (start_s, end_s))  
                 self.scene_list.addItem(item)
 
-            self.status.showMessage(f"Detected {len(scenes)} scenes.", 5000)
+            # --- Metrics output ---
+            msg = (
+                f"Detected {len(scenes)} scene(s) | "
+                f"threshold={threshold} | "
+                f"elapsed={elapsed_ms:.1f} ms ({elapsed_s:.2f}s)"
+            )
+            print("\n[Detection Metrics]")
+            print(f"File: {os.path.basename(self.current_file)}")
+            print(msg)
+            print("-" * 60)
+
+            self.status.showMessage(msg)    # shows metrics; may add auto-disappearing in the future
             
         except Exception as e:
             QMessageBox.critical(self, "Detection Error", f"Failed to detect scenes:\n{e}")
