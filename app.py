@@ -199,6 +199,9 @@ class AuraClipApp(QMainWindow):
         self.current_file: str | None = None
         self.current_scenes: list | None = None
 
+        # cache of the ffmpeg check
+        self._ffmpeg_ok_result = None    
+
         # --- Main content area ---
         """ 
             [Left-Top] Video preview panel + file metadata 
@@ -429,6 +432,74 @@ class AuraClipApp(QMainWindow):
         sec = s % 60
 
         return f"{h:02d}:{m:02d}:{sec:02d}"
+    
+        # --- Guardrail Helpers ----------------------------------------------------
+    def _ffmpeg_ok(self) -> bool:
+        """
+        One-time/lazy check that ffmpeg is callable. Result is cached.
+        Prevents user from hitting Export only to learn ffmpeg isn't available. 
+        """  
+        # Cache result so subprocesses does't keep spawning         
+        if getattr(self, "_ffmpeg_ok_result", None) is not None:       
+            return self._ffmpeg_ok_result                                
+
+        ffmpeg_bin = os.environ.get("IMAGEIO_FFMPEG_EXE") or "ffmpeg"   
+        try:                                                            
+            probe = subprocess.run(                                     
+                [ffmpeg_bin, "-version"], capture_output=True, text=True
+            )                                                           
+            self._ffmpeg_ok_result = (probe.returncode == 0)            
+        except Exception:                                               
+            self._ffmpeg_ok_result = False                              
+
+        if not self._ffmpeg_ok_result:                                  
+            QMessageBox.critical(                                       
+                self, "Missing ffmpeg",                                 
+                "ffmpeg is not runnable.\n\n"                           
+                "Fix: reinstall imageio-ffmpeg (pip install imageio-ffmpeg)\n"
+                "or install system ffmpeg and relaunch Aura Clip."      
+            )                                                           
+        return self._ffmpeg_ok_result                                   
+
+    def _clamp_range(self, start_s: float, end_s: float, duration: float) -> tuple[float, float]:
+        """
+        Clamp [start_s, end_s] into [0, duration]. Returns (s, e) with s <= e.
+        """  
+        s = max(0.0, min(float(start_s), float(duration)))               
+        e = max(0.0, min(float(end_s),   float(duration)))               
+        if e < s:                                                        
+            s, e = e, s  # swap just in case user data flipped them     
+        return s, e                                                      
+
+    def _collect_valid_selections(self, duration: float) -> list[tuple[int, float, float]]:
+        """
+        Read CHECKED rows, clamp to duration, and filter out invalid/too-short ranges.
+        Returns list of (idx, start_s, end_s). Shows friendly early-exit messages when empty.
+        """  
+        if self.scene_list.count() == 0:                                 
+            QMessageBox.information(self, "Export Clips", "No scenes to select. Run detection first.")
+            return []                                                   
+
+        selections: list[tuple[int, float, float]] = []                  
+        for idx in range(self.scene_list.count()):                       
+            item = self.scene_list.item(idx)                             
+            # If the list contains the placeholder row "No scenes detected.", skip it 
+            data = item.data(Qt.ItemDataRole.UserRole)                   
+            if item.checkState() == Qt.CheckState.Checked and data:      
+                start_s, end_s = data                                    
+                s, e = self._clamp_range(start_s, end_s, duration)       
+                if (e - s) > 0.05:                                       
+                    selections.append((idx, s, e))                       
+
+        if not selections:                                              
+            QMessageBox.information(                                     
+                self, "Export Clips",                                    
+                "No valid scenes selected.\n\n"
+                "Hint: Check one or more scenes in the list. Very short segments (<0.05s) are ignored."
+            )                                                            
+            return []                                                    
+
+        return selections                                                
 
     # Scene detection implementation
     def detect_scenes(self):
@@ -486,19 +557,27 @@ class AuraClipApp(QMainWindow):
 
             if not scenes:
                 # Handle no-detection case cleanly
-                self.scene_list.addItem("No scenes detected.")
+                placeholder = QListWidgetItem("No scenes detected.")
+                placeholder.setFlags(placeholder.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                self.scene_list.addItem(placeholder) 
                 msg = f"No scenes found | threshold={threshold} | elapsed={elapsed_ms:.1f} ms"
                 print(msg)                      # console record for empirical logs
                 self.status.showMessage(msg)    # may add auto-disappearing in the future
                 return
+            
+            # Grab media duration to keep times within range                   
+            info = self.get_media_info(self.current_file)                      
+            duration = float(info.get("duration", 0.0)) if info else 0.0 
 
                 # Populate list with checkable items + store raw (start_s, end_s)
             for i, (start, end) in enumerate(scenes, start=1):
                 start_s = self._to_seconds(start)
                 end_s   = self._to_seconds(end)
-                item = QListWidgetItem(
-                    f"Scene {i}: {self.format_time(start_s)} → {self.format_time(end_s)}"
-                )
+                # Clamp for safety/consistency                                   
+                if duration > 0:
+                    start_s, end_s = self._clamp_range(start_s, end_s, duration)  
+                label = f"Scene {i}: {self.format_time(start_s)} → {self.format_time(end_s)}"
+                item = QListWidgetItem(label)
                 item.setCheckState(Qt.CheckState.Unchecked)
                 item.setData(Qt.ItemDataRole.UserRole, (start_s, end_s))
                 self.scene_list.addItem(item)
@@ -640,67 +719,25 @@ class AuraClipApp(QMainWindow):
             return
         
         # --- 2) Tool sanity: confirm ffmpeg is runnable
-        ffmpeg_bin = os.environ.get("IMAGEIO_FFMPEG_EXE") or "ffmpeg" 
-        try:                                                          
-            probe = subprocess.run([ffmpeg_bin, "-version"], capture_output=True, text=True)
-            if probe.returncode != 0:
-                raise RuntimeError("ffmpeg not runnable")
-        except Exception:
-            QMessageBox.critical(
-                self, 
-                "Missing ffmpeg", 
-                "ffmpeg is not runnable. Reinstall imageio-ffmpeg or system ffmpeg."
-                )
-            return
+        if not self._ffmpeg_ok():  
+            return 
 
         # --- 3) Selection: collect ONLY checked rows; skip ~0s segments; scene number given in detect 
         # stays the same during export to avoid user confusion
-        selections = []  # (idx, start_s, end_s)  
-        for idx in range(self.scene_list.count()):                                        
-            item = self.scene_list.item(idx)                                              
-            if item.checkState() == Qt.CheckState.Checked:                                
-                data = item.data(Qt.ItemDataRole.UserRole)
-                if not data:
-                    continue
-                start_s, end_s = data                     
-                # Skip invalid or near-zero-length segments
-                if (end_s - start_s) > 0.05:
-                    selections.append((idx, start_s, end_s))                               
-
-        if not selections:                                                               
-            QMessageBox.information(
-                self, 
-                "Export Clips", 
-                "No scenes selected to export."
-                )
-            return     
-
-        # --- 4) Safety: clamp (start,end) to the media duration to avoid out-of-range/OOB writes
-        info = self.get_media_info(self.current_file)                  
-        duration = float(info.get("duration", 0.0)) if info else 0.0   
-        if duration <= 0.05:                                            
+        info = self.get_media_info(self.current_file)
+        duration = float(info.get("duration", 0.0)) if info else 0.0
+        if duration <= 0.05:
             QMessageBox.critical(
                 self, 
                 "Export Clips", 
                 "Invalid media duration; cannot export."
-                )  
-            return                                                     
+                )
+            return
 
-        clamped = [] 
-        for idx, s, e in selections:  
-            # Ensure times are within [0, duration]                                 
-            s2 = max(0.0, min(s, duration))                            
-            e2 = max(0.0, min(e, duration))                             
-            if e2 - s2 > 0.05:                                          
-                clamped.append((idx, s2, e2))                          
-        
-        if not clamped:                                                 
-            QMessageBox.information(
-                self, 
-                "Export Clips", 
-                "Nothing to export after clamping times."
-                ) 
-            return             
+        # --- 4) Safety: clamp (start,end) to the media duration to avoid out-of-range/OOB writes
+        clamped = self._collect_valid_selections(duration)  
+        if not clamped:                                     
+            return                
 
         # --- 5) IO prep: create ./exports and verify we can write there
         basename = os.path.splitext(os.path.basename(self.current_file))[0]
