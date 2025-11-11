@@ -28,7 +28,7 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
 # --- Standard Library ---
-import sys, os, subprocess, time
+import sys, os, subprocess, time, json, csv, datetime
 
 class Worker(QObject):
     """
@@ -531,7 +531,44 @@ class AuraClipApp(QMainWindow):
             )                                                            
             return []                                                    
 
-        return selections                                                
+        return selections  
+
+        # --- Run Logging Helpers ---
+    def _log_run(self, kind: str, data: dict):   
+        """
+            Write detection/export summaries to /runs as JSON + CSV.  
+            kind: "detect" or "export"
+            data: flat dict containing summary info
+        """   
+        try:   
+            runs_dir = os.path.join(os.getcwd(), "runs")  
+            os.makedirs(runs_dir, exist_ok=True)   
+
+            # --- JSON log ---
+            json_path = os.path.join(runs_dir, f"{kind}_log.json")  
+            log_entry = {"timestamp": datetime.datetime.now().isoformat(), **data}  
+            logs = []   
+            if os.path.exists(json_path):  
+                try:   
+                    with open(json_path, "r", encoding="utf-8") as f:   
+                        logs = json.load(f) or []   
+                except Exception:   
+                    logs = []  
+            logs.append(log_entry)   
+            with open(json_path, "w", encoding="utf-8") as f:   
+                json.dump(logs, f, indent=2)   
+
+            # --- CSV log ---
+            csv_path = os.path.join(runs_dir, f"{kind}_log.csv")  
+            write_header = not os.path.exists(csv_path)   
+            with open(csv_path, "a", newline="", encoding="utf-8") as f:   
+                writer = csv.DictWriter(f, fieldnames=log_entry.keys())   
+                if write_header:   
+                    writer.writeheader()   
+                writer.writerow(log_entry)   
+
+        except Exception as e:   
+            print(f"[LOGGING WARNING] Could not log {kind} run: {e}")                                                 
 
     # Scene detection implementation
     def detect_scenes(self):
@@ -628,6 +665,16 @@ class AuraClipApp(QMainWindow):
             print(msg)
             print("-" * 60)
             self.status.showMessage(msg)  # shows metrics; may add auto-disappearing in the future
+
+            # --- Log detection summary ---  
+            self._log_run("detect", {  
+                "file": os.path.basename(self.current_file),  
+                "operation": "detect",  
+                "scenes_found": len(scenes),  
+                "threshold": threshold,  
+                "elapsed_s": round(payload.get("elapsed_s", 0.0), 3),  
+            })  
+
 
         # Wire signals: when the thread starts, run the worker; when done, handle result
         self._detect_worker.finished.connect(on_finished, Qt.ConnectionType.QueuedConnection)  
@@ -886,6 +933,18 @@ class AuraClipApp(QMainWindow):
                 f"Export summary: requested={requested} | ok={ok} | "
                 f"failed={failed} | elapsed={elapsed_ms:.1f} ms ({elapsed_s:.2f}s)"
             )
+
+            # Log export summary 
+            self._log_run("export", {  
+                "file": os.path.basename(self.current_file),  
+                "operation": "export", 
+                "requested": requested,   
+                "ok": ok,   
+                "failed": failed,  
+                "elapsed_s": round(elapsed_s, 3),  
+                "export_dir": export_dir,   
+            })   
+
 
             # Print results to console for empirical data logging
             print("\n[Export Metrics]")
