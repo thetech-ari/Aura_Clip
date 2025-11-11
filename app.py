@@ -349,6 +349,8 @@ class AuraClipApp(QMainWindow):
 
         self._media_duration_ms = 0
 
+        self.status.showMessage("Idle — > ready to import a video.", 4000)
+
     # Helper to enable/disable both actions at once
     def set_actions_enabled(self, loaded: bool) -> None:
         self.detect_action.setEnabled(loaded) 
@@ -428,10 +430,7 @@ class AuraClipApp(QMainWindow):
         )
 
         # Show a message on the right
-        self.status.showMessage("Video loaded. Next: Tools → Detect Scenes.", 5000)  
-
-        self.scene_list.clear() # to clear previous detections
-        self.status.showMessage(f"Imported: {basename}", 5000)  
+        self.status.showMessage(f"Imported {basename}. Use Tools > Detect Scenes.", 6000)  
 
         # enable Detect/Export now that a file is loaded
         self.set_actions_enabled(True)
@@ -611,6 +610,7 @@ class AuraClipApp(QMainWindow):
         # Finish chain: deliver payload > stop thread > clean up objects
         def on_finished(payload):
             self._progress_done("Detection complete.")
+            self.status.showMessage("Detection done! Review scenes, then Export", 5000)
             QApplication.restoreOverrideCursor()
             self.detect_action.setEnabled(True)
             self.export_action.setEnabled(bool(self.current_file))
@@ -620,7 +620,7 @@ class AuraClipApp(QMainWindow):
                 QMessageBox.critical(
                     self, 
                     "Detection Error", 
-                    str(payload)
+                    "Scene detection failed. Check console for details."
                     )
                 return
 
@@ -638,7 +638,7 @@ class AuraClipApp(QMainWindow):
                 self.scene_list.addItem(placeholder) 
                 msg = f"No scenes found | threshold={threshold} | elapsed={elapsed_ms:.1f} ms"
                 print(msg)                      # console record for empirical logs
-                self.status.showMessage(msg)    # may add auto-disappearing in the future
+                self.status.showMessage(msg, 6000)    
                 return
             
             # Grab media duration to keep times within range                   
@@ -658,15 +658,11 @@ class AuraClipApp(QMainWindow):
                 self.scene_list.addItem(item)
 
             # --- Metrics output 
-            msg = (f"Detected {len(scenes)} scene(s) | threshold={threshold} | "
-                f"elapsed={elapsed_ms:.1f} ms")
-            print("\n[Detection Metrics]")
-            print(f"File: {os.path.basename(self.current_file)}")
+            msg = f"Detected {len(scenes)} scene(s) | Threshold={threshold} | {elapsed_ms:.1f} ms"
             print(msg)
-            print("-" * 60)
-            self.status.showMessage(msg)  # shows metrics; may add auto-disappearing in the future
+            self.status.showMessage(msg, 6000)  # shows metrics
 
-            # --- Log detection summary ---  
+            # --- Log detection summary for analytics ---  
             self._log_run("detect", {  
                 "file": os.path.basename(self.current_file),  
                 "operation": "detect",  
@@ -798,7 +794,7 @@ class AuraClipApp(QMainWindow):
     def _progress_done(self, msg: str = ""):                                            
         # Hide progress and optionally set a final status message                
         if msg:                                                                         
-            self.status.showMessage(msg)                                               
+            self.status.showMessage(msg, 4000)                                               
         self.progress.setVisible(False)                                                
         self.progress.setRange(0, 1)                                                  
         self.progress.setValue(0)   
@@ -861,7 +857,9 @@ class AuraClipApp(QMainWindow):
         # Check write permission to ensure we can export files
         if not os.access(export_dir, os.W_OK):
             QMessageBox.critical(
-                self, "Export Clips", f"No write permission to:\n{export_dir}"
+                self, 
+                "Export Clips", 
+                f"No write permission to:\n{export_dir}"
             )
             return                                           
 
@@ -906,6 +904,7 @@ class AuraClipApp(QMainWindow):
            
             # Restores UI controls, shows results, and reports metrics.
             self._progress_done("Export complete.")
+            self.status.showMessage("Export done! Clips saved to exports folder", 6000)
             QApplication.restoreOverrideCursor()
             self.detect_action.setEnabled(True)
             self.export_action.setEnabled(True)
@@ -915,7 +914,7 @@ class AuraClipApp(QMainWindow):
                 QMessageBox.critical(
                     self, 
                     "Export Error", 
-                    str(payload)
+                    "Invalid video duration — cannot export."
                     )
                 return
             
@@ -961,7 +960,7 @@ class AuraClipApp(QMainWindow):
             print("-" * 60)
 
             # Keep metrics visible in the status bar; may add auto disappear in future
-            self.status.showMessage(metrics_line)
+            self.status.showMessage(metrics_line, 8000)
 
             # --- 10) User-facing dialogs summarizing outcome 
             if ok > 0 and failed == 0:
@@ -989,9 +988,7 @@ class AuraClipApp(QMainWindow):
                 QMessageBox.critical(
                     self,
                     "Export Error",
-                    "No clips were exported.\n\n"
-                    f"ffmpeg stderr (first failure):\n{hint or '(no stderr)'}\n\n"
-                    f"Directory:\n{export_dir}\n\n{metrics_line}",
+                    "No clips were successfully exported.\nPlease verify ffmpeg and try again.",
                 )
 
             # --- 11) Cosmetic: visually mark exported scenes in the UI 
