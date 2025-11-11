@@ -17,11 +17,12 @@ Plus: preview player with play/pause, ±/-5s, seek; click scene to seek; double-
 
 # Third-party libraries & Qt widgets used to build the UI
 # PyQt6 drives the desktop UI to create the base window.
-from PyQt6.QtCore import Qt, QUrl, QThread, QObject, pyqtSignal
+from PyQt6.QtCore import Qt, QUrl, QThread, QObject, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QStatusBar, QMenuBar,
     QFileDialog, QMessageBox, QWidget, QHBoxLayout,
     QListWidget, QListWidgetItem, QPushButton, QSlider, QStyle,
+    QProgressBar
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -32,9 +33,12 @@ import sys, os, subprocess, time
 class Worker(QObject):
     """
     Generic worker that runs a callable in a background thread.
-    Emits `finished` with either the result dict or an Exception.
+    Emits 
+        - progress(object): optional progress payloads from the job
+        - finished(object): result dict or an Exception
     """
     finished = pyqtSignal(object)
+    progress = pyqtSignal(object)
 
     def __init__(self, fn, *args, **kwargs):
         super().__init__()
@@ -44,7 +48,11 @@ class Worker(QObject):
 
     def run(self):
         try:
-            result = self._fn(*self._args, **self._kwargs)
+            # If the target function accepts a 'report' kwarg, provide a signal-emitting callable.  
+            if hasattr(self._fn, "__code__") and "report" in self._fn.__code__.co_varnames:   
+                result = self._fn(*self._args, report=self.progress.emit, **self._kwargs)      
+            else:                                                                            
+                result = self._fn(*self._args, **self._kwargs)                               
             self.finished.emit(result)
         except Exception as e:
             self.finished.emit(e)
@@ -87,7 +95,7 @@ import imageio_ffmpeg
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 os.environ["IMAGEIO_FFMPEG_EXE"] = FFMPEG_EXE
 
-def _detect_job(api, filepath, threshold=27.0):
+def _detect_job(api, filepath, threshold=27.0, report=None):
     """
         Background job for scene detection.
         Runs outside the GUI thread via QtConcurrent to avoid UI freezes.
@@ -104,6 +112,9 @@ def _detect_job(api, filepath, threshold=27.0):
             - elapsed_s: total wall time in seconds
     """
     start_time = time.perf_counter()        # start timing
+
+    if callable(report):                                                    
+        report({"phase": "detect", "mode": "start"}) 
 
     if api == "v0.6+":
         # v0.6+ API: open video, configure manager, add detector, run
@@ -127,9 +138,11 @@ def _detect_job(api, filepath, threshold=27.0):
         raise RuntimeError("Unsupported PySceneDetect API version.")
     
     elapsed_s = time.perf_counter() - start_time        # total detection time
+    if callable(report):                                                    
+        report({"phase": "detect", "mode": "end", "elapsed_s": elapsed_s})  
     return {"scenes": scenes, "threshold": threshold, "elapsed_s": elapsed_s}
 
-def _export_job(run_ffmpeg_slice, scene_count, basename, src_file, selections, duration, export_dir):
+def _export_job(run_ffmpeg_slice, scene_count, basename, src_file, selections, duration, export_dir, report=None):
     """
         Background job for exporting selected scenes via ffmpeg.
         Runs outside the GUI thread via QtConcurrent to avoid UI freezes.
@@ -161,6 +174,11 @@ def _export_job(run_ffmpeg_slice, scene_count, basename, src_file, selections, d
     # Pad scene index in filenames so they sort nicely
     pad = max(2, len(str(scene_count)))
 
+    total = len(selections)                                                 
+    done = 0                                                                 
+    if callable(report):                                                   
+        report({"phase": "export", "done": done, "total": total})
+
     # Export each selected scene using the provided ffmpeg helper
     for (idx, start_s, end_s) in selections:
         scene_num = idx + 1
@@ -173,6 +191,9 @@ def _export_job(run_ffmpeg_slice, scene_count, basename, src_file, selections, d
         else:
             # Keep enough context to show useful diagnostics to the user
             errors.append((scene_num, start_s, end_s, err))
+        done += 1                                                          
+        if callable(report):                                               
+            report({"phase": "export", "done": done, "total": total, "last_ok": bool(ok), "scene": scene_num})
 
     elapsed_s = time.perf_counter() - start_wall        # total export time
 
@@ -185,7 +206,7 @@ def _export_job(run_ffmpeg_slice, scene_count, basename, src_file, selections, d
         "export_dir": export_dir,
     }
 
-# ----- MAIN WINDOW -----
+# ----------------------------------------------- M A I N   W I N D O W ----------------------------------------
 class AuraClipApp(QMainWindow):
     
     def __init__(self):
@@ -201,6 +222,9 @@ class AuraClipApp(QMainWindow):
 
         # cache of the ffmpeg check
         self._ffmpeg_ok_result = None    
+
+        # cached duration for UI-thread safety
+        self._media_duration = 0.0    
 
         # --- Main content area ---
         """ 
@@ -259,6 +283,12 @@ class AuraClipApp(QMainWindow):
         # Displays messages to the user, such as file loaded or task complete.
         self.status = QStatusBar(self)
         self.setStatusBar(self.status)
+
+        # Progress bar lives in the status bar; hidden until work runs.                  
+        self.progress = QProgressBar(self)                                               
+        self.progress.setVisible(False)                                                 
+        self.progress.setTextVisible(False)                                             
+        self.status.addPermanentWidget(self.progress, 0) 
 
         # --- Menu Bar ---
         # The menu bar gives the user structured access to actions.
@@ -374,7 +404,9 @@ class AuraClipApp(QMainWindow):
         
         # Record file and read media info
         self.current_file = file_path  
-        info = self.get_media_info(file_path)
+        info = self.get_media_info(self.current_file)
+        self._media_duration = float(info.get("duration", 0.0)) if info else 0.0
+
         # load into player
         self.player.setSource(QUrl.fromLocalFile(self.current_file))
         self.player.pause()
@@ -433,7 +465,7 @@ class AuraClipApp(QMainWindow):
 
         return f"{h:02d}:{m:02d}:{sec:02d}"
     
-        # --- Guardrail Helpers ----------------------------------------------------
+    # --- Safety Net Helpers ----------------------------------------------------
     def _ffmpeg_ok(self) -> bool:
         """
         One-time/lazy check that ffmpeg is callable. Result is cached.
@@ -522,7 +554,7 @@ class AuraClipApp(QMainWindow):
             return
 
         # Immediate user feedback + block re-entrancy while running
-        self.status.showMessage("Detecting scenes... please wait.")
+        self._progress_busy("Detecting scenes... please wait.")
         self.detect_action.setEnabled(False)
         self.export_action.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -531,27 +563,34 @@ class AuraClipApp(QMainWindow):
         self._detect_thread = QThread(self)
         self._detect_worker = Worker(_detect_job, SCENEDETECT_API, self.current_file, 27.0)
         self._detect_worker.moveToThread(self._detect_thread)
+
+        def on_progress(payload):                                                   
+            pass  # keep spinner running; nothing else needed                                                      
+        self._detect_worker.progress.connect(on_progress) 
         
+        # Start the worker when thread starts (queued, non-blocking)             
+        self._detect_thread.started.connect(self._detect_worker.run, Qt.ConnectionType.QueuedConnection)  
+        
+        # Finish chain: deliver payload > stop thread > clean up objects
         def on_finished(payload):
-            # Back on the GUI thread
+            self._progress_done("Detection complete.")
             QApplication.restoreOverrideCursor()
             self.detect_action.setEnabled(True)
             self.export_action.setEnabled(bool(self.current_file))
-            self._detect_thread.finished.connect(lambda: setattr(self, "_detect_thread", None))
-            self._detect_thread.destroyed.connect(lambda: setattr(self, "_detect_thread", None))
 
-
+            # --- Update UI list (uses cached duration to avoid slow probe)
             if isinstance(payload, Exception):
-                QMessageBox.critical(self, "Detection Error", f"Failed to detect scenes:\n{payload}")
-                self.status.showMessage("Scene detection failed.", 5000)
+                QMessageBox.critical(
+                    self, 
+                    "Detection Error", 
+                    str(payload)
+                    )
                 return
 
-            scenes = payload["scenes"]
-            threshold = payload["threshold"]
-            elapsed_s = payload["elapsed_s"]
-            elapsed_ms = elapsed_s * 1000.0  # milliseconds
-                
-            # --- Update UI list ---
+            scenes = payload.get("scenes", [])  
+            threshold = payload.get("threshold", 27.0)
+            elapsed_ms = (payload.get("elapsed_s", 0.0) or 0.0) * 1000.0   # milliseconds
+           
             self.current_scenes = scenes
             self.scene_list.clear()
 
@@ -566,8 +605,7 @@ class AuraClipApp(QMainWindow):
                 return
             
             # Grab media duration to keep times within range                   
-            info = self.get_media_info(self.current_file)                      
-            duration = float(info.get("duration", 0.0)) if info else 0.0 
+            duration = float(self._media_duration) or 0.0 
 
                 # Populate list with checkable items + store raw (start_s, end_s)
             for i, (start, end) in enumerate(scenes, start=1):
@@ -584,7 +622,7 @@ class AuraClipApp(QMainWindow):
 
             # --- Metrics output 
             msg = (f"Detected {len(scenes)} scene(s) | threshold={threshold} | "
-                f"elapsed={elapsed_ms:.1f} ms ({elapsed_s:.2f}s)")
+                f"elapsed={elapsed_ms:.1f} ms")
             print("\n[Detection Metrics]")
             print(f"File: {os.path.basename(self.current_file)}")
             print(msg)
@@ -592,12 +630,20 @@ class AuraClipApp(QMainWindow):
             self.status.showMessage(msg)  # shows metrics; may add auto-disappearing in the future
 
         # Wire signals: when the thread starts, run the worker; when done, handle result
-        self._detect_thread.started.connect(self._detect_worker.run)
-        self._detect_worker.finished.connect(on_finished)
-        self._detect_worker.finished.connect(self._detect_thread.quit)   # stop the thread
-        self._detect_thread.finished.connect(self._detect_worker.deleteLater)   # safe cleanup
-        self._detect_thread.finished.connect(self._detect_thread.deleteLater)
-        self._detect_thread.start()
+        self._detect_worker.finished.connect(on_finished, Qt.ConnectionType.QueuedConnection)  
+        self._detect_worker.finished.connect(self._detect_thread.quit)
+        self._detect_worker.finished.connect(self._detect_worker.deleteLater)  
+        self._detect_thread.finished.connect(self._detect_thread.deleteLater)  
+
+        # Failsafe: if something goes wrong and we never get finished, unfreeze UI  
+        QTimer.singleShot(60000, lambda: (                                            
+            self._progress_done("Detection timed out."),                               
+            QApplication.restoreOverrideCursor(),                                     
+            self.detect_action.setEnabled(True),                                      
+            self.export_action.setEnabled(bool(self.current_file))                    
+        ))                                                                            
+
+        self._detect_thread.start()  
 
     # helper to call ffmpeg directly and bubble up stderr if it fails
     def _run_ffmpeg_slice(self, src: str, start_s: float, end_s: float, dst: str) -> tuple[bool, str]:
@@ -687,6 +733,28 @@ class AuraClipApp(QMainWindow):
         self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
         self.status.showMessage(f"Playing from {start_s:.2f}s.", 2000)
 
+# --- Progress Bar Helpers ---
+
+    def _progress_busy(self, msg: str):                                                 
+        # Indeterminate spinner-style progress with a status message               
+        self.status.showMessage(msg)                                                   
+        self.progress.setVisible(True)                                                 
+        self.progress.setRange(0, 0)   # indeterminate                                 
+
+    def _progress_steps(self, total: int, msg: str):                                     
+        # Determinate progress with a known step count                             
+        self.status.showMessage(msg)                                                     
+        self.progress.setVisible(True)                                                 
+        self.progress.setRange(0, max(1, int(total)))                                  
+        self.progress.setValue(0)                                                      
+
+    def _progress_done(self, msg: str = ""):                                            
+        # Hide progress and optionally set a final status message                
+        if msg:                                                                         
+            self.status.showMessage(msg)                                               
+        self.progress.setVisible(False)                                                
+        self.progress.setRange(0, 1)                                                  
+        self.progress.setValue(0)   
 
     def export_clips(self):
         """
@@ -724,8 +792,7 @@ class AuraClipApp(QMainWindow):
 
         # --- 3) Selection: collect ONLY checked rows; skip ~0s segments; scene number given in detect 
         # stays the same during export to avoid user confusion
-        info = self.get_media_info(self.current_file)
-        duration = float(info.get("duration", 0.0)) if info else 0.0
+        duration = float(self._media_duration)
         if duration <= 0.05:
             QMessageBox.critical(
                 self, 
@@ -752,6 +819,7 @@ class AuraClipApp(QMainWindow):
             return                                           
 
         # --- 6) Work: for each segment, run ffmpeg and update the list row text
+        self._progress_steps(len(clamped), "Exporting clips...")
         self.status.showMessage("Exporting clips... please wait.")
         self.detect_action.setEnabled(False)
         self.export_action.setEnabled(False)
@@ -771,30 +839,47 @@ class AuraClipApp(QMainWindow):
         )
         self._export_worker.moveToThread(self._export_thread)
 
-        # --- 8) Define what happens when export finishes 
-        def on_finished(payload):
-            # Called automatically when the background export job completes.
-            # Restore UI controls and cursor
+        # Progress callback: update the determinate bar                           
+        def on_export_progress(payload):                                          
+            if not isinstance(payload, dict):                                    
+                return                                                         
+            if payload.get("phase") == "export":                                  
+                done = int(payload.get("done", 0))                                
+                total = max(1, int(payload.get("total", 1)))                             
+                self.progress.setVisible(True)                                  
+                self.progress.setRange(0, total)                          
+                self.progress.setValue(min(done, total))                          
+        self._export_worker.progress.connect(on_export_progress)
+
+        # Start the worker when thread starts (queued, non-blocking)            
+        self._export_thread.started.connect(self._export_worker.run, Qt.ConnectionType.QueuedConnection)
+
+        # --- 8) Finish chain: UI restore > quit thread > delete objects 
+        def on_finished(payload):   # Called automatically when the background export job completes.
+           
+            # Restores UI controls, shows results, and reports metrics.
+            self._progress_done("Export complete.")
             QApplication.restoreOverrideCursor()
             self.detect_action.setEnabled(True)
             self.export_action.setEnabled(True)
-            self._export_thread.finished.connect(lambda: setattr(self, "_export_thread", None))
-            self._export_thread.destroyed.connect(lambda: setattr(self, "_export_thread", None))
 
-
+            # Error handling
             if isinstance(payload, Exception):
-                QMessageBox.critical(self, "Export Error", f"Export failed:\n{payload}")
-                self.status.showMessage("Export failed.", 5000)
+                QMessageBox.critical(
+                    self, 
+                    "Export Error", 
+                    str(payload)
+                    )
                 return
             
             # Extract metrics from the payload
-            requested = payload["requested"]
-            ok = payload["ok"]
-            failed = payload["failed"]
-            errors = payload["errors"]
-            elapsed_s = payload["elapsed_s"]
-            elapsed_ms = elapsed_s * 1000.0
-            export_dir_local = payload["export_dir"]
+            requested = int(payload.get("requested", 0))                   
+            ok = int(payload.get("ok", 0))                                  
+            failed = int(payload.get("failed", 0))                         
+            export_dir = payload.get("export_dir") or os.getcwd()           
+            errors = payload.get("errors", [])                              
+            elapsed_s = float(payload.get("elapsed_s", 0.0))                
+            elapsed_ms = elapsed_s * 1000.0                     
 
             # --- 9) Metrics: console + status bar + dialogs
             metrics_line = (
@@ -825,7 +910,7 @@ class AuraClipApp(QMainWindow):
                 QMessageBox.information(
                     self,
                     "Export Complete",
-                    f"Exported {ok} scene(s) to:\n{export_dir_local}\n\n{metrics_line}",
+                    f"Exported {ok} scene(s) to:\n{export_dir}\n\n{metrics_line}",
                 )
 
             elif ok > 0 and failed > 0:
@@ -847,18 +932,19 @@ class AuraClipApp(QMainWindow):
                     "Export Error",
                     "No clips were exported.\n\n"
                     f"ffmpeg stderr (first failure):\n{hint or '(no stderr)'}\n\n"
-                    f"Directory:\n{export_dir_local}\n\n{metrics_line}",
+                    f"Directory:\n{export_dir}\n\n{metrics_line}",
                 )
 
             # --- 11) Cosmetic: visually mark exported scenes in the UI 
-            for (idx, s, e) in clamped:
-                if idx < self.scene_list.count():
-                    self.scene_list.item(idx).setText(
-                        f"Exported Scene {idx+1}: {s:.2f}s → {e:.2f}s"
-                    )
+            # Ensure 'clamped' is available from outer scope (validated selections)
+            if 'clamped' in locals() or 'clamped' in globals():             
+                for (idx, s, e) in clamped:                                
+                    if idx < self.scene_list.count():                      
+                        self.scene_list.item(idx).setText(                  
+                            f"Exported Scene {idx+1}: {s:.2f}s → {e:.2f}s"  
+                        )
 
         # --- 12) Connect worker to completion handler 
-        self._export_thread.started.connect(self._export_worker.run)
         self._export_worker.finished.connect(on_finished)
         self._export_worker.finished.connect(self._export_thread.quit)
         self._export_thread.finished.connect(self._export_worker.deleteLater)
