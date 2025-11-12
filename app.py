@@ -1,16 +1,32 @@
 """
-Aura Clip (PP4 R&D Build)
+Aura Clip - PP4 Project (Full Sail University)
 -------------------------
-Week-1 Project base with end-to-end tech stack:
+Week-1:
 
-- UI: PyQt6 (menus, status, list view, preview player)
-- Detection: PySceneDetect (supports v0.6+ and legacy v0.5 API)
-- Metadata: MoviePy (read-only probe for duration / fps / size)
-- Export: ffmpeg (via imageio-ffmpeg binary; direct subprocess calls)
+    R&D Build - Foundational Prototype
+        - Established end-to-end technical stack:
+            - UI / UX: PyQt6 window with menus, status bar, and video preview
+            - Detection: PySceneDetect (v0.6+ and legacy v0.5 API support)
+            - Metadata Probe: MoviePy (VideoFileClip) for duration / fps / size
+            - Export: FFmpeg (imageio-ffmpeg binary via subprocess calls)
+        - Implemented basic user flow (Import > Detect > Select > Export)
+        - Verified media loading and preview playback with seek and transport controls
+        - Proved multi-library integration (MoviePy + PySceneDetect + FFmpeg)
 
-User flow:
-  Import → Detect → (Select scenes) → Export
-Plus: preview player with play/pause, ±/-5s, seek; click scene to seek; double-click to play.
+    Iteration 1 - Functional and UX Expansion
+        - Added Guardrails  - validated input, clamped timestamps, ffmpeg sanity check
+        - Added Threading  - detect / export now run on QThreads with Worker class
+        - Added Progress UI  - indeterminate bar for detect, determinate bar for export
+        - Added Metrics  - console summary + /run logging (JSON and CSV)
+        - Added Polish  - status messages with timeouts, short dialogs, presenter-ready UX
+        - Ensured full guarded flow (no UI freeze or unhandled errors)
+
+Basic User flow:
+    1. Import video > read metadata (MoviePy)
+    2. Detect scenes > background thread (PySceneDetect)
+    3. Review / select scenes > check boxes in list
+    4. Export clips > FFmpeg subprocess on thread > status + logs
+    5. Preview controls > Play/Pause, Seek ±5 s, Jump to scene (start/double-click)
 """
 
 # -------- Aura Clip - Base Application Window -------
@@ -33,7 +49,7 @@ import sys, os, subprocess, time, json, csv, datetime
 class Worker(QObject):
     """
     Generic worker that runs a callable in a background thread.
-    Emits 
+    Emits back to UI: 
         - progress(object): optional progress payloads from the job
         - finished(object): result dict or an Exception
     """
@@ -98,7 +114,7 @@ os.environ["IMAGEIO_FFMPEG_EXE"] = FFMPEG_EXE
 def _detect_job(api, filepath, threshold=27.0, report=None):
     """
         Background job for scene detection.
-        Runs outside the GUI thread via QtConcurrent to avoid UI freezes.
+        Runs outside the GUI thread via QtThread to avoid UI freezes.
 
         Parameters:
         api: "v0.6+" or "v0.5" — which PySceneDetect API to use
@@ -145,7 +161,7 @@ def _detect_job(api, filepath, threshold=27.0, report=None):
 def _export_job(run_ffmpeg_slice, scene_count, basename, src_file, selections, duration, export_dir, report=None):
     """
         Background job for exporting selected scenes via ffmpeg.
-        Runs outside the GUI thread via QtConcurrent to avoid UI freezes.
+        Runs outside the GUI thread via QtThread to avoid UI freezes.
 
         Parameters:
             run_ffmpeg_slice: function(src, start_s, end_s, dst) -> (ok, stderr)
@@ -349,7 +365,7 @@ class AuraClipApp(QMainWindow):
 
         self._media_duration_ms = 0
 
-        self.status.showMessage("Idle — > ready to import a video.", 4000)
+        self.status.showMessage("Idle — > Ready to import a video!", 4000)
 
     # Helper to enable/disable both actions at once
     def set_actions_enabled(self, loaded: bool) -> None:
@@ -389,7 +405,11 @@ class AuraClipApp(QMainWindow):
             return {"duration": duration, "fps": fps, "width": w, "height": h}
         except Exception as e:
             # show an error message and return empty info
-            QMessageBox.critical(self, "Media Error", f"Could not read media info:\n{e}")
+            QMessageBox.critical(
+                self, 
+                "Media Error", 
+                f"Could not read media info:\n{e}"
+                )
             return {"duration": 0.0, "fps": 0.0, "width": 0, "height": 0}    
 
     # --- ACTIONS ---
@@ -470,7 +490,7 @@ class AuraClipApp(QMainWindow):
         One-time/lazy check that ffmpeg is callable. Result is cached.
         Prevents user from hitting Export only to learn ffmpeg isn't available. 
         """  
-        # Cache result so subprocesses does't keep spawning         
+        # Cache result so we don’t spawn subprocesses repeatedly      
         if getattr(self, "_ffmpeg_ok_result", None) is not None:       
             return self._ffmpeg_ok_result                                
 
@@ -532,7 +552,7 @@ class AuraClipApp(QMainWindow):
 
         return selections  
 
-        # --- Run Logging Helpers ---
+        # --- Run Logging Helpers ----------------------
     def _log_run(self, kind: str, data: dict):   
         """
             Write detection/export summaries to /runs as JSON + CSV.  
@@ -609,8 +629,8 @@ class AuraClipApp(QMainWindow):
         
         # Finish chain: deliver payload > stop thread > clean up objects
         def on_finished(payload):
-            self._progress_done("Detection complete.")
-            self.status.showMessage("Detection done! Review scenes, then Export", 5000)
+            self._progress_done("Detection Complete.")
+            self.status.showMessage("Detection Done! Review scenes, then Export", 5000)
             QApplication.restoreOverrideCursor()
             self.detect_action.setEnabled(True)
             self.export_action.setEnabled(bool(self.current_file))
@@ -731,7 +751,7 @@ class AuraClipApp(QMainWindow):
 
     # Map slider range [0..1000] to [0..duration_ms] and seek
     def _seek_to_ratio(self, val: int):
-        # slider 0..1000 → position 0..duration
+        # slider 0..1000 > position 0..duration
         if self._media_duration_ms > 0:
             target = int((val / 1000.0) * self._media_duration_ms)
             self.player.setPosition(target)
