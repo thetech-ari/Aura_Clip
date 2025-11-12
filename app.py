@@ -1,39 +1,85 @@
 """
-Aura Clip (PP4 R&D Build)
+Aura Clip - PP4 Project (Full Sail University)
 -------------------------
-Week-1 Project base with end-to-end tech stack:
+Week-1:
 
-- UI: PyQt6 (menus, status, list view, preview player)
-- Detection: PySceneDetect (supports v0.6+ and legacy v0.5 API)
-- Metadata: MoviePy (read-only probe for duration / fps / size)
-- Export: ffmpeg (via imageio-ffmpeg binary; direct subprocess calls)
+    R&D Build - Foundational Prototype
+        - Established end-to-end technical stack:
+            - UI / UX: PyQt6 window with menus, status bar, and video preview
+            - Detection: PySceneDetect (v0.6+ and legacy v0.5 API support)
+            - Metadata Probe: MoviePy (VideoFileClip) for duration / fps / size
+            - Export: FFmpeg (imageio-ffmpeg binary via subprocess calls)
+        - Implemented basic user flow (Import > Detect > Select > Export)
+        - Verified media loading and preview playback with seek and transport controls
+        - Proved multi-library integration (MoviePy + PySceneDetect + FFmpeg)
 
-User flow:
-  Import → Detect → (Select scenes) → Export
-Plus: preview player with play/pause, ±/-5s, seek; click scene to seek; double-click to play.
+    Iteration 1 - Functional and UX Expansion
+        - Added Guardrails  - validated input, clamped timestamps, ffmpeg sanity check
+        - Added Threading  - detect / export now run on QThreads with Worker class
+        - Added Progress UI  - indeterminate bar for detect, determinate bar for export
+        - Added Metrics  - console summary + /run logging (JSON and CSV)
+        - Added Polish  - status messages with timeouts, short dialogs, presenter-ready UX
+        - Ensured full guarded flow (no UI freeze or unhandled errors)
+
+Basic User flow:
+    1. Import video > read metadata (MoviePy)
+    2. Detect scenes > background thread (PySceneDetect)
+    3. Review / select scenes > check boxes in list
+    4. Export clips > FFmpeg subprocess on thread > status + logs
+    5. Preview controls > Play/Pause, Seek ±5 s, Jump to scene (start/double-click)
 """
 
 # -------- Aura Clip - Base Application Window -------
 
 # Third-party libraries & Qt widgets used to build the UI
 # PyQt6 drives the desktop UI to create the base window.
-from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtCore import Qt, QUrl, QThread, QObject, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QStatusBar, QMenuBar,
     QFileDialog, QMessageBox, QWidget, QHBoxLayout,
     QListWidget, QListWidgetItem, QPushButton, QSlider, QStyle,
+    QProgressBar
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
 # --- Standard Library ---
-import sys, os, subprocess
+import sys, os, subprocess, time, json, csv, datetime
+
+class Worker(QObject):
+    """
+    Generic worker that runs a callable in a background thread.
+    Emits back to UI: 
+        - progress(object): optional progress payloads from the job
+        - finished(object): result dict or an Exception
+    """
+    finished = pyqtSignal(object)
+    progress = pyqtSignal(object)
+
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+
+    def run(self):
+        try:
+            # If the target function accepts a 'report' kwarg, provide a signal-emitting callable.  
+            if hasattr(self._fn, "__code__") and "report" in self._fn.__code__.co_varnames:   
+                result = self._fn(*self._args, report=self.progress.emit, **self._kwargs)      
+            else:                                                                            
+                result = self._fn(*self._args, **self._kwargs)                               
+            self.finished.emit(result)
+        except Exception as e:
+            self.finished.emit(e)
+
 
 # --- Scene detection (PySceneDetect) ---
 # Importing scenedetect safely
 SCENEDETECT_AVAILABLE = False            
 SCENEDETECT_API = None  
-""" This supports EITHER the modern v0.6+ API OR the legacy v0.5 API """
+
+# This supports EITHER the modern v0.6+ API OR the legacy v0.5 API 
 try:
     # v0.6+ API
     from scenedetect import SceneManager, open_video        
@@ -65,20 +111,136 @@ import imageio_ffmpeg
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 os.environ["IMAGEIO_FFMPEG_EXE"] = FFMPEG_EXE
 
+def _detect_job(api, filepath, threshold=27.0, report=None):
+    """
+        Background job for scene detection.
+        Runs outside the GUI thread via QtThread to avoid UI freezes.
 
-# ----- MAIN WINDOW -----
+        Parameters:
+        api: "v0.6+" or "v0.5" — which PySceneDetect API to use
+        filepath: path to the video file
+        threshold: ContentDetector threshold (higher = fewer scenes)
+
+        Returns:
+        dict with:
+            - scenes: list of (start, end) timecodes from PySceneDetect
+            - threshold: the threshold used
+            - elapsed_s: total wall time in seconds
+    """
+    start_time = time.perf_counter()        # start timing
+
+    if callable(report):                                                    
+        report({"phase": "detect", "mode": "start"}) 
+
+    if api == "v0.6+":
+        # v0.6+ API: open video, configure manager, add detector, run
+        video = open_video(filepath)
+        sm = SceneManager()
+        sm.add_detector(ContentDetector(threshold=threshold, luma_only=True))
+        sm.detect_scenes(video)
+        scenes = sm.get_scene_list()
+    elif api == "v0.5":
+        # v0.5 API: need a VideoManager explicitly, start(), detect, then release
+        vm = VideoManager([filepath])
+        sm = SceneManager()
+        sm.add_detector(ContentDetector(threshold=threshold))
+        vm.set_downscale_factor()       # speed-up: will process fewer pixels
+        vm.start()
+        sm.detect_scenes(frame_source=vm)
+        scenes = sm.get_scene_list()
+        vm.release()
+    else:
+        # In case our import shim mis-detected the API version
+        raise RuntimeError("Unsupported PySceneDetect API version.")
+    
+    elapsed_s = time.perf_counter() - start_time        # total detection time
+    if callable(report):                                                    
+        report({"phase": "detect", "mode": "end", "elapsed_s": elapsed_s})  
+    return {"scenes": scenes, "threshold": threshold, "elapsed_s": elapsed_s}
+
+def _export_job(run_ffmpeg_slice, scene_count, basename, src_file, selections, duration, export_dir, report=None):
+    """
+        Background job for exporting selected scenes via ffmpeg.
+        Runs outside the GUI thread via QtThread to avoid UI freezes.
+
+        Parameters:
+            run_ffmpeg_slice: function(src, start_s, end_s, dst) -> (ok, stderr)
+            scene_count: total count of items currently in the scene list (for name padding)
+            basename: base output name derived from the loaded file
+            src_file: original video path
+            selections: list[(idx, start_s, end_s)] — clamped selections to export
+            duration: media duration in seconds (already probed)
+            export_dir: destination folder
+        
+        Returns:
+            dict with:
+                - requested: number of segments we attempted to export
+                - ok: number of successful exports
+                - failed: number of failed exports
+                - errors: list of (scene_num, start_s, end_s, stderr_text) for failures
+                - elapsed_s: total wall time in seconds
+                - export_dir: echo back the directory for UI display
+    """
+
+    start_wall = time.perf_counter()    # start timing
+
+    exported_ok = 0     # count successes
+    errors = []         # collect details for failures
+
+    # Pad scene index in filenames so they sort nicely
+    pad = max(2, len(str(scene_count)))
+
+    total = len(selections)                                                 
+    done = 0                                                                 
+    if callable(report):                                                   
+        report({"phase": "export", "done": done, "total": total})
+
+    # Export each selected scene using the provided ffmpeg helper
+    for (idx, start_s, end_s) in selections:
+        scene_num = idx + 1
+        out_path = os.path.join(export_dir, f"{basename}_scene_{scene_num:0{pad}d}.mp4")
+
+        # Run ffmpeg slice; returns (ok, stderr)
+        ok, err = run_ffmpeg_slice(src_file, start_s, end_s, out_path)
+        if ok:
+            exported_ok += 1
+        else:
+            # Keep enough context to show useful diagnostics to the user
+            errors.append((scene_num, start_s, end_s, err))
+        done += 1                                                          
+        if callable(report):                                               
+            report({"phase": "export", "done": done, "total": total, "last_ok": bool(ok), "scene": scene_num})
+
+    elapsed_s = time.perf_counter() - start_wall        # total export time
+
+    return {
+        "requested": len(selections),
+        "ok": exported_ok,
+        "failed": len(errors),
+        "errors": errors,
+        "elapsed_s": elapsed_s,
+        "export_dir": export_dir,
+    }
+
+# ----------------------------------------------- M A I N   W I N D O W ----------------------------------------
 class AuraClipApp(QMainWindow):
     
     def __init__(self):
         super().__init__()
 
         # --- Window chrome & state ---
-        self.setWindowTitle("Aura Clip - Scene Detection R&D")
+        self.setWindowTitle("Aura Clip - Iteration 1")
         self.setGeometry(200, 200, 900, 600)
 
         # Track the currently selected file path + detected scenes in memory
         self.current_file: str | None = None
         self.current_scenes: list | None = None
+
+        # cache of the ffmpeg check
+        self._ffmpeg_ok_result = None    
+
+        # cached duration for UI-thread safety
+        self._media_duration = 0.0    
 
         # --- Main content area ---
         """ 
@@ -137,6 +299,12 @@ class AuraClipApp(QMainWindow):
         # Displays messages to the user, such as file loaded or task complete.
         self.status = QStatusBar(self)
         self.setStatusBar(self.status)
+
+        # Progress bar lives in the status bar; hidden until work runs.                  
+        self.progress = QProgressBar(self)                                               
+        self.progress.setVisible(False)                                                 
+        self.progress.setTextVisible(False)                                             
+        self.status.addPermanentWidget(self.progress, 0) 
 
         # --- Menu Bar ---
         # The menu bar gives the user structured access to actions.
@@ -197,6 +365,8 @@ class AuraClipApp(QMainWindow):
 
         self._media_duration_ms = 0
 
+        self.status.showMessage("Idle — > Ready to import a video!", 4000)
+
     # Helper to enable/disable both actions at once
     def set_actions_enabled(self, loaded: bool) -> None:
         self.detect_action.setEnabled(loaded) 
@@ -235,7 +405,11 @@ class AuraClipApp(QMainWindow):
             return {"duration": duration, "fps": fps, "width": w, "height": h}
         except Exception as e:
             # show an error message and return empty info
-            QMessageBox.critical(self, "Media Error", f"Could not read media info:\n{e}")
+            QMessageBox.critical(
+                self, 
+                "Media Error", 
+                f"Could not read media info:\n{e}"
+                )
             return {"duration": 0.0, "fps": 0.0, "width": 0, "height": 0}    
 
     # --- ACTIONS ---
@@ -252,14 +426,17 @@ class AuraClipApp(QMainWindow):
         
         # Record file and read media info
         self.current_file = file_path  
-        info = self.get_media_info(file_path)
+        info = self.get_media_info(self.current_file)
+        self._media_duration = float(info.get("duration", 0.0)) if info else 0.0
+
         # load into player
         self.player.setSource(QUrl.fromLocalFile(self.current_file))
         self.player.pause()
         self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))  
 
         # Format a user-friendly display, rounding values for readability
-        duration_s = round(info["duration"], 2)  
+        duration_s = round(info["duration"], 2)
+        duration_ts = self.format_time(duration_s)  # HH:MM:SS  
         fps = round(info["fps"], 2)              
         w, h = info["width"], info["height"]     
 
@@ -267,85 +444,269 @@ class AuraClipApp(QMainWindow):
         basename = os.path.basename(file_path)  
         self.info_label.setText(                    
             f"Loaded file:\n{basename}\n\n"
-            f"Duration: {duration_s}s\n"
+            f"Duration: {duration_ts}s\n"
             f"FPS: {fps}\n"
             f"Resolution: {w} x {h}"
         )
 
         # Show a message on the right
-        self.status.showMessage("Video loaded. Next: Tools → Detect Scenes.", 5000)  
-
-        self.scene_list.clear() # to clear previous detections
-        self.status.showMessage(f"Imported: {basename}", 5000)  
+        self.status.showMessage(f"Imported {basename}. Use Tools > Detect Scenes.", 6000)  
 
         # enable Detect/Export now that a file is loaded
         self.set_actions_enabled(True)
 
+    def _to_seconds(self, tc) -> float:
+        # PySceneDetect timecodes (v0.5/v0.6) or floats to seconds
+        try:
+            return float(tc.get_seconds())
+        except Exception:
+            try:
+                # v0.6 VideoTimecode exposes get_seconds()
+                return float(tc)  # already numeric
+            except Exception:
+                return 0.0
+
+    def format_time(self, seconds: float) -> str:
+        """
+            Convert a float number of seconds to a human-friendly timestamp.
+            Returns HH:MM:SS (zero-padded), e.g., 00:03:07 for 187s.
+                - Clamps negatives to 0.
+            This is for *positions* in the media (scene starts/ends), not performance timing.
+        """
+        try:
+            s = max(0, int(round(float(seconds))))
+        except Exception: 
+            s = 0
+
+        h = s // 3600
+        m = (s % 3600) // 60
+        sec = s % 60
+
+        return f"{h:02d}:{m:02d}:{sec:02d}"
+    
+    # --- Safety Net Helpers ----------------------------------------------------
+    def _ffmpeg_ok(self) -> bool:
+        """
+        One-time/lazy check that ffmpeg is callable. Result is cached.
+        Prevents user from hitting Export only to learn ffmpeg isn't available. 
+        """  
+        # Cache result so we don’t spawn subprocesses repeatedly      
+        if getattr(self, "_ffmpeg_ok_result", None) is not None:       
+            return self._ffmpeg_ok_result                                
+
+        ffmpeg_bin = os.environ.get("IMAGEIO_FFMPEG_EXE") or "ffmpeg"   
+        try:                                                            
+            probe = subprocess.run(                                     
+                [ffmpeg_bin, "-version"], capture_output=True, text=True
+            )                                                           
+            self._ffmpeg_ok_result = (probe.returncode == 0)            
+        except Exception:                                               
+            self._ffmpeg_ok_result = False                              
+
+        if not self._ffmpeg_ok_result:                                  
+            QMessageBox.critical(                                       
+                self, "Missing ffmpeg",                                 
+                "ffmpeg is not runnable.\n\n"                           
+                "Fix: reinstall imageio-ffmpeg (pip install imageio-ffmpeg)\n"
+                "or install system ffmpeg and relaunch Aura Clip."      
+            )                                                           
+        return self._ffmpeg_ok_result                                   
+
+    def _clamp_range(self, start_s: float, end_s: float, duration: float) -> tuple[float, float]:
+        """
+        Clamp [start_s, end_s] into [0, duration]. Returns (s, e) with s <= e.
+        """  
+        s = max(0.0, min(float(start_s), float(duration)))               
+        e = max(0.0, min(float(end_s),   float(duration)))               
+        if e < s:                                                        
+            s, e = e, s  # swap just in case user data flipped them     
+        return s, e                                                      
+
+    def _collect_valid_selections(self, duration: float) -> list[tuple[int, float, float]]:
+        """
+        Read CHECKED rows, clamp to duration, and filter out invalid/too-short ranges.
+        Returns list of (idx, start_s, end_s). Shows friendly early-exit messages when empty.
+        """  
+        if self.scene_list.count() == 0:                                 
+            QMessageBox.information(self, "Export Clips", "No scenes to select. Run detection first.")
+            return []                                                   
+
+        selections: list[tuple[int, float, float]] = []                  
+        for idx in range(self.scene_list.count()):                       
+            item = self.scene_list.item(idx)                             
+            # If the list contains the placeholder row "No scenes detected.", skip it 
+            data = item.data(Qt.ItemDataRole.UserRole)                   
+            if item.checkState() == Qt.CheckState.Checked and data:      
+                start_s, end_s = data                                    
+                s, e = self._clamp_range(start_s, end_s, duration)       
+                if (e - s) > 0.05:                                       
+                    selections.append((idx, s, e))                       
+
+        if not selections:                                              
+            QMessageBox.information(                                     
+                self, "Export Clips",                                    
+                "No valid scenes selected.\n\n"
+                "Hint: Check one or more scenes in the list. Very short segments (<0.05s) are ignored."
+            )                                                            
+            return []                                                    
+
+        return selections  
+
+        # --- Run Logging Helpers ----------------------
+    def _log_run(self, kind: str, data: dict):   
+        """
+            Write detection/export summaries to /runs as JSON + CSV.  
+            kind: "detect" or "export"
+            data: flat dict containing summary info
+        """   
+        try:   
+            runs_dir = os.path.join(os.getcwd(), "runs")  
+            os.makedirs(runs_dir, exist_ok=True)   
+
+            # --- JSON log ---
+            json_path = os.path.join(runs_dir, f"{kind}_log.json")  
+            log_entry = {"timestamp": datetime.datetime.now().isoformat(), **data}  
+            logs = []   
+            if os.path.exists(json_path):  
+                try:   
+                    with open(json_path, "r", encoding="utf-8") as f:   
+                        logs = json.load(f) or []   
+                except Exception:   
+                    logs = []  
+            logs.append(log_entry)   
+            with open(json_path, "w", encoding="utf-8") as f:   
+                json.dump(logs, f, indent=2)   
+
+            # --- CSV log ---
+            csv_path = os.path.join(runs_dir, f"{kind}_log.csv")  
+            write_header = not os.path.exists(csv_path)   
+            with open(csv_path, "a", newline="", encoding="utf-8") as f:   
+                writer = csv.DictWriter(f, fieldnames=log_entry.keys())   
+                if write_header:   
+                    writer.writeheader()   
+                writer.writerow(log_entry)   
+
+        except Exception as e:   
+            print(f"[LOGGING WARNING] Could not log {kind} run: {e}")                                                 
+
     # Scene detection implementation
     def detect_scenes(self):
         # Run PySceneDetect and populate the scene list(will support v0.6 and v0.5)
-        # Run PySceneDetect and populate the scene list 
+        """
+            Run PySceneDetect and populate the scene list while collecting
+            empirical performance data (timing + scene counts) without freezing the UI.
+            Uses QThread + Worker to run heavy detection off the GUI thread.
+        """
 
         if not self.current_file:
             QMessageBox.information(self, "No File", "Please import a video first.")
             return
         if not SCENEDETECT_AVAILABLE:
             QMessageBox.critical(
-                self, "Missing Library",
+                self, 
+                "Missing Library",
                 "PySceneDetect not available.\nInstall with:\n  pip install scenedetect"
             )
             return
 
-        self.status.showMessage("Detecting scenes... please wait.")
-        QApplication.processEvents()    # keep UI responsive during detection
+        # Immediate user feedback + block re-entrancy while running
+        self._progress_busy("Detecting scenes... please wait.")
+        self.detect_action.setEnabled(False)
+        self.export_action.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
-        try:
-            # --- Run detection for the appropriate API ---
-            if SCENEDETECT_API == "v0.6+":
-                video = open_video(self.current_file)          # v0.6+ path
-                scene_manager = SceneManager()
-                scene_manager.add_detector(ContentDetector(threshold=27.0))
-                scene_manager.detect_scenes(video)
-                scenes = scene_manager.get_scene_list()
+        # Spin up a one-off worker thread for detection
+        self._detect_thread = QThread(self)
+        self._detect_worker = Worker(_detect_job, SCENEDETECT_API, self.current_file, 27.0)
+        self._detect_worker.moveToThread(self._detect_thread)
 
-            elif SCENEDETECT_API == "v0.5":
-                video_manager = VideoManager([self.current_file])   # v0.5 path
-                scene_manager = SceneManager()
-                scene_manager.add_detector(ContentDetector(threshold=27.0))
-                video_manager.set_downscale_factor()
-                video_manager.start()
-                scene_manager.detect_scenes(frame_source=video_manager)
-                scenes = scene_manager.get_scene_list()
-                video_manager.release()
+        def on_progress(payload):                                                   
+            pass  # keep spinner running; nothing else needed                                                      
+        self._detect_worker.progress.connect(on_progress) 
+        
+        # Start the worker when thread starts (queued, non-blocking)             
+        self._detect_thread.started.connect(self._detect_worker.run, Qt.ConnectionType.QueuedConnection)  
+        
+        # Finish chain: deliver payload > stop thread > clean up objects
+        def on_finished(payload):
+            self._progress_done("Detection Complete.")
+            self.status.showMessage("Detection Done! Review scenes, then Export", 5000)
+            QApplication.restoreOverrideCursor()
+            self.detect_action.setEnabled(True)
+            self.export_action.setEnabled(bool(self.current_file))
 
-            else:
-                raise RuntimeError("Unsupported PySceneDetect API version.")
+            # --- Update UI list (uses cached duration to avoid slow probe)
+            if isinstance(payload, Exception):
+                QMessageBox.critical(
+                    self, 
+                    "Detection Error", 
+                    "Scene detection failed. Check console for details."
+                    )
+                return
 
-            # --- Update UI list ---
+            scenes = payload.get("scenes", [])  
+            threshold = payload.get("threshold", 27.0)
+            elapsed_ms = (payload.get("elapsed_s", 0.0) or 0.0) * 1000.0   # milliseconds
+           
             self.current_scenes = scenes
             self.scene_list.clear()
 
             if not scenes:
-                self.scene_list.addItem("No scenes detected.")
-                self.status.showMessage("No scenes found.", 4000)
+                # Handle no-detection case cleanly
+                placeholder = QListWidgetItem("No scenes detected.")
+                placeholder.setFlags(placeholder.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                self.scene_list.addItem(placeholder) 
+                msg = f"No scenes found | threshold={threshold} | elapsed={elapsed_ms:.1f} ms"
+                print(msg)                      # console record for empirical logs
+                self.status.showMessage(msg, 6000)    
                 return
+            
+            # Grab media duration to keep times within range                   
+            duration = float(self._media_duration) or 0.0 
 
-            # Populate list with readable timecodes + 
-            # checkable scene items and store(start_s, end_s)
+                # Populate list with checkable items + store raw (start_s, end_s)
             for i, (start, end) in enumerate(scenes, start=1):
-                start_s = start.get_seconds()
-                end_s = end.get_seconds()
-                item_text = f"Scene {i}: {start_s:.2f}s → {end_s:.2f}s"
-                item = QListWidgetItem(item_text)
-                item.setCheckState(Qt.CheckState.Unchecked)                
-                item.setData(Qt.ItemDataRole.UserRole, (start_s, end_s))  
+                start_s = self._to_seconds(start)
+                end_s   = self._to_seconds(end)
+                # Clamp for safety/consistency                                   
+                if duration > 0:
+                    start_s, end_s = self._clamp_range(start_s, end_s, duration)  
+                label = f"Scene {i}: {self.format_time(start_s)} → {self.format_time(end_s)}"
+                item = QListWidgetItem(label)
+                item.setCheckState(Qt.CheckState.Unchecked)
+                item.setData(Qt.ItemDataRole.UserRole, (start_s, end_s))
                 self.scene_list.addItem(item)
 
-            self.status.showMessage(f"Detected {len(scenes)} scenes.", 5000)
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Detection Error", f"Failed to detect scenes:\n{e}")
-            self.status.showMessage("Scene detection failed.", 5000)
+            # --- Metrics output 
+            msg = f"Detected {len(scenes)} scene(s) | Threshold={threshold} | {elapsed_ms:.1f} ms"
+            print(msg)
+            self.status.showMessage(msg, 6000)  # shows metrics
+
+            # --- Log detection summary for analytics ---  
+            self._log_run("detect", {  
+                "file": os.path.basename(self.current_file),  
+                "operation": "detect",  
+                "scenes_found": len(scenes),  
+                "threshold": threshold,  
+                "elapsed_s": round(payload.get("elapsed_s", 0.0), 3),  
+            })  
+
+
+        # Wire signals: when the thread starts, run the worker; when done, handle result
+        self._detect_worker.finished.connect(on_finished, Qt.ConnectionType.QueuedConnection)  
+        self._detect_worker.finished.connect(self._detect_thread.quit)
+        self._detect_worker.finished.connect(self._detect_worker.deleteLater)  
+        self._detect_thread.finished.connect(self._detect_thread.deleteLater)  
+
+        # Failsafe: if something goes wrong and we never get finished, unfreeze UI  
+        QTimer.singleShot(60000, lambda: (                                            
+            self._progress_done("Detection timed out."),                               
+            QApplication.restoreOverrideCursor(),                                     
+            self.detect_action.setEnabled(True),                                      
+            self.export_action.setEnabled(bool(self.current_file))                    
+        ))                                                                            
+
+        self._detect_thread.start()  
 
     # helper to call ffmpeg directly and bubble up stderr if it fails
     def _run_ffmpeg_slice(self, src: str, start_s: float, end_s: float, dst: str) -> tuple[bool, str]:
@@ -390,7 +751,7 @@ class AuraClipApp(QMainWindow):
 
     # Map slider range [0..1000] to [0..duration_ms] and seek
     def _seek_to_ratio(self, val: int):
-        # slider 0..1000 → position 0..duration
+        # slider 0..1000 > position 0..duration
         if self._media_duration_ms > 0:
             target = int((val / 1000.0) * self._media_duration_ms)
             self.player.setPosition(target)
@@ -435,22 +796,42 @@ class AuraClipApp(QMainWindow):
         self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
         self.status.showMessage(f"Playing from {start_s:.2f}s.", 2000)
 
+# --- Progress Bar Helpers ---
+
+    def _progress_busy(self, msg: str):                                                 
+        # Indeterminate spinner-style progress with a status message               
+        self.status.showMessage(msg)                                                   
+        self.progress.setVisible(True)                                                 
+        self.progress.setRange(0, 0)   # indeterminate                                 
+
+    def _progress_steps(self, total: int, msg: str):                                     
+        # Determinate progress with a known step count                             
+        self.status.showMessage(msg)                                                     
+        self.progress.setVisible(True)                                                 
+        self.progress.setRange(0, max(1, int(total)))                                  
+        self.progress.setValue(0)                                                      
+
+    def _progress_done(self, msg: str = ""):                                            
+        # Hide progress and optionally set a final status message                
+        if msg:                                                                         
+            self.status.showMessage(msg, 4000)                                               
+        self.progress.setVisible(False)                                                
+        self.progress.setRange(0, 1)                                                  
+        self.progress.setValue(0)   
 
     def export_clips(self):
         """
-            Export all CHECKED scenes to ./exports as MP4 using ffmpeg
+            Export all CHECKED scenes to ./exports as MP4 using ffmpeg, without freezing the UI
+            Uses QThread + Worker to run ffmpeg work off the GUI thread
 
-            Pipeline / why each step exists:
-            1) Preconditions: ensure a file is loaded and scenes exist
-            2) Tool sanity: confirm ffmpeg is runnable 
-            3) Selection: collect ONLY checked rows; skip ~0s segments
-            4) Safety: clamp (start,end) to the media duration to avoid out-of-range/OOB writes
-            5) IO prep: create ./exports and verify we can write there
-            6) Work: for each segment, run ffmpeg and update the list row text
-            7) UX summary: success, partial success (show first stderr), or failure
+            Metrics added (Iteration 1 - Commit: Export Summary + Timings):
+            - requested (selected after clamping) vs ok vs failed
+            - total elapsed wall time
+            - first stderr snippet if any failures
+            - status-bar summary + console block
         """
         
-        # --- 1) Preconditions
+        # --- 1) Preconditions: ensure a file is loaded and scenes exist
         if not self.current_file:
             self.set_actions_enabled(False)
             QMessageBox.information(
@@ -461,103 +842,190 @@ class AuraClipApp(QMainWindow):
             return
 
         if not self.current_scenes or self.scene_list.count() == 0:
-            QMessageBox.information(self, "Export Clips", "No detected scenes found. Run detection first.")
+            QMessageBox.information(
+                self, 
+                "Export Clips", 
+                "No detected scenes found. Run detection first."
+            )
             return
         
-        # --- 2) Tool sanity
-        ffmpeg_bin = os.environ.get("IMAGEIO_FFMPEG_EXE") or "ffmpeg" 
-        try:                                                          
-            probe = subprocess.run([ffmpeg_bin, "-version"], capture_output=True, text=True)
-            if probe.returncode != 0:
-                raise RuntimeError("ffmpeg not runnable")
-        except Exception:
-            QMessageBox.critical(self, "Missing ffmpeg", "ffmpeg is not runnable. Reinstall imageio-ffmpeg or system ffmpeg.")
+        # --- 2) Tool sanity: confirm ffmpeg is runnable
+        if not self._ffmpeg_ok():  
+            return 
+
+        # --- 3) Selection: collect ONLY checked rows; skip ~0s segments; scene number given in detect 
+        # stays the same during export to avoid user confusion
+        duration = float(self._media_duration)
+        if duration <= 0.05:
+            QMessageBox.critical(
+                self, 
+                "Export Clips", 
+                "Invalid media duration; cannot export."
+                )
             return
 
-        # --- 3) Selection
-        selections = []  # (idx, start_s, end_s)  
-        for idx in range(self.scene_list.count()):                                        
-            item = self.scene_list.item(idx)                                              
-            if item.checkState() == Qt.CheckState.Checked:                                
-                start_s, end_s = item.data(Qt.ItemDataRole.UserRole)                     
-                if (end_s - start_s) > 0.05:    # Ignore tiny/zero-length slices to avoid writer errors and empty files.  
-                    selections.append((idx, start_s, end_s))                               
+        # --- 4) Safety: clamp (start,end) to the media duration to avoid out-of-range/OOB writes
+        clamped = self._collect_valid_selections(duration)  
+        if not clamped:                                     
+            return                
 
-        if not selections:                                                               
-            QMessageBox.information(self, "Export Clips", "No scenes selected to export.")
-            return     
-
-        # --- 4) Safety
-        info = self.get_media_info(self.current_file)                  
-        duration = float(info.get("duration", 0.0)) if info else 0.0   
-        if duration <= 0.05:                                            
-            QMessageBox.critical(self, "Export Clips", "Invalid media duration; cannot export.")  
-            return                                                     
-
-        clamped = [] 
-        for idx, s, e in selections:                                   
-            s2 = max(0.0, min(s, duration))                            
-            e2 = max(0.0, min(e, duration))                             
-            if e2 - s2 > 0.05:                                          
-                clamped.append((idx, s2, e2))                          
-        if not clamped:                                                 
-            QMessageBox.information(self, "Export Clips", "Nothing to export after clamping times.") 
-            return              
-
-        # --- 5) IO prep
-        self.status.showMessage("Exporting clips... please wait.")
-        QApplication.processEvents()
-
+        # --- 5) IO prep: create ./exports and verify we can write there
         basename = os.path.splitext(os.path.basename(self.current_file))[0]
         export_dir = os.path.join(os.getcwd(), "exports")
         os.makedirs(export_dir, exist_ok=True)
 
-        # check write permission before attempting
-        if not os.access(export_dir, os.W_OK):                        
-            QMessageBox.critical(self, "Export Clips", f"No write permission to:\n{export_dir}")  
+        # Check write permission to ensure we can export files
+        if not os.access(export_dir, os.W_OK):
+            QMessageBox.critical(
+                self, 
+                "Export Clips", 
+                f"No write permission to:\n{export_dir}"
+            )
             return                                           
 
-        # --- 6) Work
-        exported = 0
-        errors = []     # [(scene_number, start_s, end_s, stderr_text)]
+        # --- 6) Work: for each segment, run ffmpeg and update the list row text
+        self._progress_steps(len(clamped), "Exporting clips...")
+        self.status.showMessage("Exporting clips... please wait.")
+        self.detect_action.setEnabled(False)
+        self.export_action.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
-        for n, (idx, start_s, end_s) in enumerate(clamped, start=1): 
-            out_path = os.path.join(export_dir, f"{basename}_scene_{n:02d}.mp4")
-            ok, err = self._run_ffmpeg_slice(self.current_file, start_s, end_s, out_path)
-            if ok:
-                # Immediate per-row confirmation helps the user trust the export.
-                self.scene_list.item(idx).setText(                    
-                    f"Exported Scene {n}: {start_s:.2f}s → {end_s:.2f}s"
-                )
-                exported += 1
-            else:
-                # Keep enough context to display a helpful summary to the user.
-                errors.append((n, start_s, end_s, err))  
+        # --- 7) Run export in a worker thread (no UI freeze)
+        self._export_thread = QThread(self)
+        self._export_worker = Worker(
+            _export_job,                     # background function
+            self._run_ffmpeg_slice,          # ffmpeg helper
+            self.scene_list.count(),         # total scene count (for file naming)
+            basename,                        # base name for output files
+            self.current_file,               # source video
+            clamped,                         # validated time ranges
+            duration,                        # duration (for context)
+            export_dir,                      # destination folder
+        )
+        self._export_worker.moveToThread(self._export_thread)
 
-        # --- 7) UX summary
-        if exported > 0 and not errors:
-            self.status.showMessage(f"Exported {exported} clip(s).", 6000)
-            QMessageBox.information(self, "Export Complete", f"Exported {exported} scene(s) to:\n{export_dir}")
-        elif exported > 0 and errors:
-            n, s, e, err = errors[0]                                  
-            self.status.showMessage(f"Exported {exported} clip(s), {len(errors)} failed.", 8000)
-            QMessageBox.warning( 
-                self,  
-                "Export Partially Complete",
-                f"Exported {exported} clip(s), {len(errors)} failed.\n"
-                f"First failure (Scene {n} {s:.2f}s→{e:.2f}s):\n{err or '(no stderr)'}"
-                )
-        else:
-            # show the actual ffmpeg stderr to make debugging easy
-            hint = errors[0][3] if errors else "ffmpeg returned a non-zero code." 
-            QMessageBox.critical(                                                  
-                self,
-                "Export Error",
-                "No clips were exported.\n\n"
-                f"ffmpeg stderr (first failure):\n{hint or '(no stderr)'}\n\n"
-                f"Check write perms for:\n{export_dir}"
+        # Progress callback: update the determinate bar                           
+        def on_export_progress(payload):                                          
+            if not isinstance(payload, dict):                                    
+                return                                                         
+            if payload.get("phase") == "export":                                  
+                done = int(payload.get("done", 0))                                
+                total = max(1, int(payload.get("total", 1)))                             
+                self.progress.setVisible(True)                                  
+                self.progress.setRange(0, total)                          
+                self.progress.setValue(min(done, total))                          
+        self._export_worker.progress.connect(on_export_progress)
+
+        # Start the worker when thread starts (queued, non-blocking)            
+        self._export_thread.started.connect(self._export_worker.run, Qt.ConnectionType.QueuedConnection)
+
+        # --- 8) Finish chain: UI restore > quit thread > delete objects 
+        def on_finished(payload):   # Called automatically when the background export job completes.
+           
+            # Restores UI controls, shows results, and reports metrics.
+            self._progress_done("Export complete.")
+            self.status.showMessage("Export done! Clips saved to exports folder", 6000)
+            QApplication.restoreOverrideCursor()
+            self.detect_action.setEnabled(True)
+            self.export_action.setEnabled(True)
+
+            # Error handling
+            if isinstance(payload, Exception):
+                QMessageBox.critical(
+                    self, 
+                    "Export Error", 
+                    "Invalid video duration — cannot export."
+                    )
+                return
+            
+            # Extract metrics from the payload
+            requested = int(payload.get("requested", 0))                   
+            ok = int(payload.get("ok", 0))                                  
+            failed = int(payload.get("failed", 0))                         
+            export_dir = payload.get("export_dir") or os.getcwd()           
+            errors = payload.get("errors", [])                              
+            elapsed_s = float(payload.get("elapsed_s", 0.0))                
+            elapsed_ms = elapsed_s * 1000.0                     
+
+            # --- 9) Metrics: console + status bar + dialogs
+            metrics_line = (
+                f"Export summary: requested={requested} | ok={ok} | "
+                f"failed={failed} | elapsed={elapsed_ms:.1f} ms ({elapsed_s:.2f}s)"
             )
-            self.status.showMessage("Export failed.", 5000)
+
+            # Log export summary 
+            self._log_run("export", {  
+                "file": os.path.basename(self.current_file),  
+                "operation": "export", 
+                "requested": requested,   
+                "ok": ok,   
+                "failed": failed,  
+                "elapsed_s": round(elapsed_s, 3),  
+                "export_dir": export_dir,   
+            })   
+
+
+            # Print results to console for empirical data logging
+            print("\n[Export Metrics]")
+            print(f"File: {os.path.basename(self.current_file)}")
+            print(metrics_line)
+
+            # If any scenes failed, print the first stderr snippet
+            if failed:
+                n, s, e, err = errors[0]
+                snippet = (err or "").strip().splitlines()
+                snippet = snippet[0] if snippet else "(no stderr)"
+                print(f"First failure: Scene {n} {s:.2f}s→{e:.2f}s")
+                print(f"stderr: {snippet}")
+            print("-" * 60)
+
+            # Keep metrics visible in the status bar; may add auto disappear in future
+            self.status.showMessage(metrics_line, 8000)
+
+            # --- 10) User-facing dialogs summarizing outcome 
+            if ok > 0 and failed == 0:
+                # All exports succeeded
+                QMessageBox.information(
+                    self,
+                    "Export Complete",
+                    f"Exported {ok} scene(s) to:\n{export_dir}\n\n{metrics_line}",
+                )
+
+            elif ok > 0 and failed > 0:
+                # Some succeeded, some failed; partial completion
+                n, s, e, err = errors[0]
+                QMessageBox.warning(
+                    self,
+                    "Export Partially Complete",
+                    f"Exported {ok} clip(s), {failed} failed.\n"
+                    f"First failure (Scene {n} {s:.2f}s→{e:.2f}s):\n"
+                    f"{err or '(no stderr)'}\n\n{metrics_line}",
+                )
+
+            else:
+                # No successful exports
+                hint = errors[0][3] if errors else "ffmpeg returned a non-zero code."
+                QMessageBox.critical(
+                    self,
+                    "Export Error",
+                    "No clips were successfully exported.\nPlease verify ffmpeg and try again.",
+                )
+
+            # --- 11) Cosmetic: visually mark exported scenes in the UI 
+            # Ensure 'clamped' is available from outer scope (validated selections)
+            if 'clamped' in locals() or 'clamped' in globals():             
+                for (idx, s, e) in clamped:                                
+                    if idx < self.scene_list.count():                      
+                        self.scene_list.item(idx).setText(                  
+                            f"Exported Scene {idx+1}: {s:.2f}s → {e:.2f}s"  
+                        )
+
+        # --- 12) Connect worker to completion handler 
+        self._export_worker.finished.connect(on_finished)
+        self._export_worker.finished.connect(self._export_thread.quit)
+        self._export_thread.finished.connect(self._export_worker.deleteLater)
+        self._export_thread.finished.connect(self._export_thread.deleteLater)
+        self._export_thread.start()
 
     def open_settings(self):
         # Placeholder for app settings dialog.
@@ -571,11 +1039,54 @@ class AuraClipApp(QMainWindow):
         QMessageBox.information(
             self,
             "About Aura Clip",
-            "Aura Clip (PP4 R&D Build)\n\n"
+            "Aura Clip (PP4 Iteration 1 Build)\n\n"
             "Developed by Arianna Miller-Paul (Full Sail University)\n"
             "This app demonstrates the integration of PyQt6 + MoviePy + PySceneDetect."
         )
         print("Displayed About dialog.")
+
+    def closeEvent(self, event):
+        """
+        Ensure background threads are stopped before the window is destroyed,
+        but be tolerant if Qt already deleted them (avoids RuntimeError).
+        """
+        def _safe_stop(name: str):
+            t = getattr(self, name, None)
+            if not t:
+                return
+            try:
+                # t may already be C++-deleted; any attribute access can raise RuntimeError
+                running = False
+                try:
+                    running = t.isRunning()
+                except RuntimeError:
+                    running = False
+
+                if running:
+                    try:
+                        t.requestInterruption()
+                    except Exception:
+                        pass
+                    try:
+                        t.quit()
+                    except Exception:
+                        pass
+                    try:
+                        t.wait(3000)
+                    except Exception:
+                        pass
+            except RuntimeError:
+                # The wrapper is pointing at a deleted C++ object; ignore.
+                pass
+            finally:
+                # Clear our reference no matter what
+                setattr(self, name, None)
+
+        _safe_stop("_detect_thread")
+        _safe_stop("_export_thread")
+
+        super().closeEvent(event)
+
 
 
 # --- Application Entry Point ---
