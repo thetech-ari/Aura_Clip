@@ -21,6 +21,16 @@ Week-1:
         - Added Polish  - status messages with timeouts, short dialogs, presenter-ready UX
         - Ensured full guarded flow (no UI freeze or unhandled errors)
 
+Week 2:
+
+    Iteration 2:
+        - Signal architecture maturity with modular analyzers and richer metrics output
+        - Lay groundwork for machine-learning-based highlight detection(optical flow / brightness / audio peaks)
+        - Extend per-scene detection metrics and CSV logging
+        - Modularize PySceneDetect logic for analyzer integration
+        - Add “Detection Mode” switch (Manual | PySceneDetect | AI-Experimental)
+        - Establish dataset export and automated test stubs for model validation
+
 Basic User flow:
     1. Import video > read metadata (MoviePy)
     2. Detect scenes > background thread (PySceneDetect)
@@ -38,10 +48,12 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QStatusBar, QMenuBar,
     QFileDialog, QMessageBox, QWidget, QHBoxLayout,
     QListWidget, QListWidgetItem, QPushButton, QSlider, QStyle,
-    QProgressBar
+    QProgressBar, QLabel
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
+
+from config import settings, DetectionMode
 
 # --- Standard Library ---
 import sys, os, subprocess, time, json, csv, datetime
@@ -229,7 +241,7 @@ class AuraClipApp(QMainWindow):
         super().__init__()
 
         # --- Window chrome & state ---
-        self.setWindowTitle("Aura Clip - Iteration 1")
+        self.setWindowTitle("Aura Clip - Iteration 2")
         self.setGeometry(200, 200, 900, 600)
 
         # Track the currently selected file path + detected scenes in memory
@@ -245,7 +257,7 @@ class AuraClipApp(QMainWindow):
         # --- Main content area ---
         """ 
             [Left-Top] Video preview panel + file metadata 
-            [Left-Bottom]Transport Bar (video playback buttons and slider)
+            [Left-Bottom] Transport Bar (video playback buttons and slider)
             [Right] Checkable scene list (one row per detected segment) 
         """
         # preview + info + scenes
@@ -306,6 +318,11 @@ class AuraClipApp(QMainWindow):
         self.progress.setTextVisible(False)                                             
         self.status.addPermanentWidget(self.progress, 0) 
 
+        # Detection Mode Label
+        self.mode_label = QLabel(self)
+        self.statusBar().addPermanentWidget(self.mode_label)
+        self.update_mode_label()  # show current detection mode at startup
+
         # --- Menu Bar ---
         # The menu bar gives the user structured access to actions.
         menubar = QMenuBar(self)
@@ -319,6 +336,18 @@ class AuraClipApp(QMainWindow):
 
         exit_action = file_menu.addAction("Exit")
         exit_action.triggered.connect(self.close)
+
+        # Detection Mode Menu 
+        mode_menu = menubar.addMenu("Detection Mode")
+
+        manual_action = mode_menu.addAction("Manual")
+        pysd_action = mode_menu.addAction("PySceneDetect")
+        ai_action = mode_menu.addAction("AI (Experimental)")
+
+        manual_action.triggered.connect(lambda: self.set_mode(DetectionMode.MANUAL))
+        pysd_action.triggered.connect(lambda: self.set_mode(DetectionMode.PYSDETECT))
+        ai_action.triggered.connect(lambda: self.set_mode(DetectionMode.AI_EXPERIMENTAL))
+
 
         # Tools Menu (Detect / Export buttons)
         tools_menu = menubar.addMenu("Tools")
@@ -370,7 +399,22 @@ class AuraClipApp(QMainWindow):
     # Helper to enable/disable both actions at once
     def set_actions_enabled(self, loaded: bool) -> None:
         self.detect_action.setEnabled(loaded) 
-        self.export_action.setEnabled(loaded)  
+        self.export_action.setEnabled(loaded)
+
+    # switching detection modes
+    def update_mode_label(self):
+        if settings.detection_mode is DetectionMode.PYSDETECT:
+            text = "Detection Mode: PySceneDetect"
+        elif settings.detection_mode is DetectionMode.AI_EXPERIMENTAL:
+            text = "Detection Mode: AI (Experimental)"
+        else:
+            text = "Detection Mode: Manual"
+        self.mode_label.setText(text)  
+
+    def set_mode(self, mode):
+        settings.detection_mode = mode
+        self.update_mode_label()
+        self.statusBar().showMessage(f"Switched to {self.mode_label.text()}", 3000)
 
     def get_media_info(self, file_path: str) -> dict:  
         """
