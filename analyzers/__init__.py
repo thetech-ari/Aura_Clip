@@ -7,8 +7,10 @@ Iteration 2:
 """
 
 from .pyscenedetect_analyzer import SCENEDETECT_AVAILABLE, run_pyscenedetect
+from .ai_experimental import run_ai_detection
 
 __all__ = [
     "SCENEDETECT_AVAILABLE",
     "run_pyscenedetect",
+    "run_ai_detection",
 ]

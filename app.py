@@ -54,7 +54,7 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
 from config import settings, DetectionMode
-from analyzers import SCENEDETECT_AVAILABLE, run_pyscenedetect
+from analyzers import SCENEDETECT_AVAILABLE, run_pyscenedetect, run_ai_detection
 
 # --- Standard Library ---
 import sys, os, subprocess, time, json, csv, datetime
@@ -593,16 +593,27 @@ class AuraClipApp(QMainWindow):
         if not self.current_file:
             QMessageBox.information(self, "No File", "Please import a video first.")
             return
-        if not SCENEDETECT_AVAILABLE:
-            QMessageBox.critical(
-                self, 
-                "Missing Library",
-                "PySceneDetect not available.\nInstall with:\n  pip install scenedetect"
-            )
-            return
+                # Decide which detection backend to use based on DetectionMode
+        mode = settings.detection_mode
+
+        if mode is DetectionMode.AI_EXPERIMENTAL:
+            backend_fn = run_ai_detection
+            backend_label = "AI (Experimental)"
+        else:
+            # For now, MANUAL falls back to PySceneDetect behavior too
+            if not SCENEDETECT_AVAILABLE:
+                QMessageBox.critical(
+                    self,
+                    "Missing Library",
+                    "PySceneDetect not available.\nInstall with:\n  pip install scenedetect",
+                )
+                return
+
+            backend_fn = run_pyscenedetect   # from analyzers.pyscenedetect_analyzer
+            backend_label = "PySceneDetect"
 
         # Immediate user feedback + block re-entrancy while running
-        self._progress_busy("Detecting scenes... please wait.")
+        self._progress_busy(f"Detecting scenes using {backend_label}... please wait.")
         self.detect_action.setEnabled(False)
         self.export_action.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -610,9 +621,9 @@ class AuraClipApp(QMainWindow):
         # Spin up a one-off worker thread for detection
         self._detect_thread = QThread(self)
         self._detect_worker = Worker(
-            run_pyscenedetect,
+            backend_fn,
             self.current_file,
-            27.0,  # threshold
+            27.0,  # threshold ; currently ignored by AI stub 
         )
         self._detect_worker.moveToThread(self._detect_thread)
 
