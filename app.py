@@ -54,6 +54,7 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
 from config import settings, DetectionMode
+from analyzers import SCENEDETECT_AVAILABLE, run_pyscenedetect
 
 # --- Standard Library ---
 import sys, os, subprocess, time, json, csv, datetime
@@ -84,12 +85,6 @@ class Worker(QObject):
             self.finished.emit(result)
         except Exception as e:
             self.finished.emit(e)
-
-
-# --- Scene detection (PySceneDetect) ---
-# Importing scenedetect safely
-SCENEDETECT_AVAILABLE = False            
-SCENEDETECT_API = None  
 
 # This supports EITHER the modern v0.6+ API OR the legacy v0.5 API 
 try:
@@ -122,53 +117,6 @@ except Exception:
 import imageio_ffmpeg
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 os.environ["IMAGEIO_FFMPEG_EXE"] = FFMPEG_EXE
-
-def _detect_job(api, filepath, threshold=27.0, report=None):
-    """
-        Background job for scene detection.
-        Runs outside the GUI thread via QtThread to avoid UI freezes.
-
-        Parameters:
-        api: "v0.6+" or "v0.5" — which PySceneDetect API to use
-        filepath: path to the video file
-        threshold: ContentDetector threshold (higher = fewer scenes)
-
-        Returns:
-        dict with:
-            - scenes: list of (start, end) timecodes from PySceneDetect
-            - threshold: the threshold used
-            - elapsed_s: total wall time in seconds
-    """
-    start_time = time.perf_counter()        # start timing
-
-    if callable(report):                                                    
-        report({"phase": "detect", "mode": "start"}) 
-
-    if api == "v0.6+":
-        # v0.6+ API: open video, configure manager, add detector, run
-        video = open_video(filepath)
-        sm = SceneManager()
-        sm.add_detector(ContentDetector(threshold=threshold, luma_only=True))
-        sm.detect_scenes(video)
-        scenes = sm.get_scene_list()
-    elif api == "v0.5":
-        # v0.5 API: need a VideoManager explicitly, start(), detect, then release
-        vm = VideoManager([filepath])
-        sm = SceneManager()
-        sm.add_detector(ContentDetector(threshold=threshold))
-        vm.set_downscale_factor()       # speed-up: will process fewer pixels
-        vm.start()
-        sm.detect_scenes(frame_source=vm)
-        scenes = sm.get_scene_list()
-        vm.release()
-    else:
-        # In case our import shim mis-detected the API version
-        raise RuntimeError("Unsupported PySceneDetect API version.")
-    
-    elapsed_s = time.perf_counter() - start_time        # total detection time
-    if callable(report):                                                    
-        report({"phase": "detect", "mode": "end", "elapsed_s": elapsed_s})  
-    return {"scenes": scenes, "threshold": threshold, "elapsed_s": elapsed_s}
 
 def _export_job(run_ffmpeg_slice, scene_count, basename, src_file, selections, duration, export_dir, report=None):
     """
@@ -661,7 +609,11 @@ class AuraClipApp(QMainWindow):
 
         # Spin up a one-off worker thread for detection
         self._detect_thread = QThread(self)
-        self._detect_worker = Worker(_detect_job, SCENEDETECT_API, self.current_file, 27.0)
+        self._detect_worker = Worker(
+            run_pyscenedetect,
+            self.current_file,
+            27.0,  # threshold
+        )
         self._detect_worker.moveToThread(self._detect_thread)
 
         def on_progress(payload):                                                   
