@@ -55,6 +55,7 @@ from PyQt6.QtMultimediaWidgets import QVideoWidget
 
 from config import settings, DetectionMode
 from analyzers import SCENEDETECT_AVAILABLE, run_pyscenedetect, run_ai_detection
+from run_logs.metrics import append_summary, append_rows
 
 # --- Standard Library ---
 import sys, os, subprocess, time, json, csv, datetime
@@ -548,35 +549,12 @@ class AuraClipApp(QMainWindow):
     def _log_run(self, kind: str, data: dict):   
         """
             Write detection/export summaries to /runs as JSON + CSV.  
-            kind: "detect" or "export"
-            data: flat dict containing summary info
+            
+            Delegates to run_logs.metrics.append_summary so that logging logic
+            can be reused by other modules.
         """   
         try:   
-            runs_dir = os.path.join(os.getcwd(), "runs")  
-            os.makedirs(runs_dir, exist_ok=True)   
-
-            # --- JSON log ---
-            json_path = os.path.join(runs_dir, f"{kind}_log.json")  
-            log_entry = {"timestamp": datetime.datetime.now().isoformat(), **data}  
-            logs = []   
-            if os.path.exists(json_path):  
-                try:   
-                    with open(json_path, "r", encoding="utf-8") as f:   
-                        logs = json.load(f) or []   
-                except Exception:   
-                    logs = []  
-            logs.append(log_entry)   
-            with open(json_path, "w", encoding="utf-8") as f:   
-                json.dump(logs, f, indent=2)   
-
-            # --- CSV log ---
-            csv_path = os.path.join(runs_dir, f"{kind}_log.csv")  
-            write_header = not os.path.exists(csv_path)   
-            with open(csv_path, "a", newline="", encoding="utf-8") as f:   
-                writer = csv.DictWriter(f, fieldnames=log_entry.keys())   
-                if write_header:   
-                    writer.writeheader()   
-                writer.writerow(log_entry)   
+            append_summary(kind, data)   
 
         except Exception as e:   
             print(f"[LOGGING WARNING] Could not log {kind} run: {e}")                                                 
@@ -655,6 +633,9 @@ class AuraClipApp(QMainWindow):
             threshold = payload.get("threshold", 27.0)
             elapsed_ms = (payload.get("elapsed_s", 0.0) or 0.0) * 1000.0   # milliseconds
            
+            # structured scene metrics from analyzer
+            scene_data = payload.get("scene_data", [])
+
             self.current_scenes = scenes
             self.scene_list.clear()
 
@@ -698,6 +679,32 @@ class AuraClipApp(QMainWindow):
                 "elapsed_s": round(payload.get("elapsed_s", 0.0), 3),  
             })  
 
+            # --- per-scene CSV logging for AI / analysis ---
+            try:
+                import datetime
+
+                ts = datetime.datetime.now().isoformat()
+                filename = os.path.basename(self.current_file)
+
+                rows = []
+                for sd in scene_data:
+                    # Each sd should match SceneDatum from scene_types.py
+                    row = {
+                        "timestamp": ts,
+                        "file": filename,
+                        "scene_idx": sd.get("scene_idx", -1),
+                        "start_s": sd.get("start_s", 0.0),
+                        "end_s": sd.get("end_s", 0.0),
+                        "duration_s": sd.get("duration_s", 0.0),
+                        "fps": sd.get("fps", 0.0),
+                        "threshold": sd.get("threshold", threshold),
+                        "source": sd.get("source", "unknown"),
+                    }
+                    rows.append(row)
+
+                append_rows("detect_scenes", rows)
+            except Exception as e:
+                print(f"[LOGGING WARNING] Could not log per-scene metrics: {e}")
 
         # Wire signals: when the thread starts, run the worker; when done, handle result
         self._detect_worker.finished.connect(on_finished, Qt.ConnectionType.QueuedConnection)  
