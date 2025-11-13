@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import time
 from typing import Any, Dict, List
+from .scene_types import SceneDatum, AnalyzerResult
 
 SCENEDETECT_AVAILABLE: bool = False
 SCENEDETECT_API: str | None = None
@@ -44,10 +45,12 @@ except Exception:
 def run_pyscenedetect(
     filepath: str,
     threshold: float = 27.0,
+    fps: float | None = None,
     report=None,
-) -> Dict[str, Any]:
+) -> AnalyzerResult:
+
     """
-    Background-friendly job for scene detection.
+    Background job for scene detection.
 
     This function is designed to run inside the generic Worker in app.py.
 
@@ -95,8 +98,53 @@ def run_pyscenedetect(
     if callable(report):
         report({"phase": "detect", "mode": "end", "elapsed_s": elapsed_s})
 
-    return {
-        "scenes": scenes,
+    # --- Build normalized per-scene metrics ---
+    fps_value = 0.0 if fps is None else float(fps)
+
+    scene_data: List[SceneDatum] = []
+    for idx, (start_tc, end_tc) in enumerate(scenes, start=0):
+        # PySceneDetect FrameTimecode objects provide get_seconds()
+        try:
+            start_s = float(start_tc.get_seconds())
+            end_s = float(end_tc.get_seconds())
+        except AttributeError:
+            # In case a future backend returns plain floats
+            start_s = float(start_tc)
+            end_s = float(end_tc)
+
+        duration_s = max(0.0, end_s - start_s)
+
+        scene_data.append(
+            SceneDatum(
+                scene_idx=idx,
+                start_s=start_s,
+                end_s=end_s,
+                duration_s=duration_s,
+                fps=fps_value,
+                threshold=float(threshold),
+                source="pyscenedetect",
+            )
+        )
+
+    # Summary is lightweight now; more fields later will be added later
+    summary: Dict[str, Any] = {
+        "backend": "pyscenedetect",
+        "api": SCENEDETECT_API,
         "threshold": float(threshold),
         "elapsed_s": float(elapsed_s),
+        "video_fps": fps_value,
+        "scene_count": len(scene_data),
     }
+
+    # keeps 'scenes' (raw PySceneDetect output) for UI/export compatibility
+    result: AnalyzerResult = {
+        "scenes": scenes,
+        "scene_data": scene_data,
+        "summary": summary,
+        "threshold": float(threshold),
+        "elapsed_s": float(elapsed_s),
+        "backend": "pyscenedetect",
+        "api": SCENEDETECT_API,
+    }
+
+    return result

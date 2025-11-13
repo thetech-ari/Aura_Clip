@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import time
 from typing import Any, Dict
-
+from .scene_types import SceneDatum, AnalyzerResult
 
 def run_ai_detection(
     filepath: str,
     threshold: float = 0.0,
     report=None,
-) -> Dict[str, Any]:
+) -> AnalyzerResult:
     """
     Stubbed AI detection backend.
 
@@ -58,9 +58,21 @@ def run_ai_detection(
             }
         )
 
-    return {
-        "scenes": [],
+    summary: Dict[str, Any] = {
+        "backend": "ai_stub",
+        "threshold": 0.0,
+        "elapsed_s": float(elapsed_s),
+        "scene_count": 0,
+    }
+
+    result: AnalyzerResult = {
+        "scenes": [],        # no raw scenes yet
+        "scene_data": [],    # no metrics yet
+        "summary": summary,
         "threshold": 0.0,
         "elapsed_s": float(elapsed_s),
         "backend": "ai_stub",
     }
+
+    return result
+
