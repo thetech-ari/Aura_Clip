@@ -588,7 +588,7 @@ class AuraClipApp(QMainWindow):
                     "Missing Library",
                     "PySceneDetect not available.\nInstall with:\n  pip install scenedetect",
                 )
-                return
+                return 
 
             backend_fn = run_pyscenedetect   # from analyzers.pyscenedetect_analyzer
             backend_label = "PySceneDetect"
