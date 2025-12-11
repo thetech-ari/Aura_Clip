@@ -1115,3 +1115,5 @@ if __name__ == "__main__":
     window = AuraClipApp()
     window.show()
     sys.exit(app.exec())
+
+#scripts + test folder creation
