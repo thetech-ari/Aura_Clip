@@ -17,6 +17,7 @@ class SceneDatum(TypedDict):
     fps: float           # video frames per second (0.0 if unknown)
     threshold: float     # detector threshold value used
     source: str          # "pyscenedetect" or "ai"
+    motion_proxy: float  # placeholder motion indicator: 1 / max(0.1, duration_s)
 
 
 class AnalyzerResult(TypedDict, total=False):

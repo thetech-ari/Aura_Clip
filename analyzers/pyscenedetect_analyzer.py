@@ -114,6 +114,9 @@ def run_pyscenedetect(
 
         duration_s = max(0.0, end_s - start_s)
 
+        # Lightweight motion proxy: shorter scenes → higher proxy value
+        motion_proxy = 1.0 / max(0.1, duration_s)
+
         scene_data.append(
             SceneDatum(
                 scene_idx=idx,
@@ -123,6 +126,7 @@ def run_pyscenedetect(
                 fps=fps_value,
                 threshold=float(threshold),
                 source="pyscenedetect",
+                motion_proxy=motion_proxy,
             )
         )
 

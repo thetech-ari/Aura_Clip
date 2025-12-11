@@ -201,7 +201,9 @@ class AuraClipApp(QMainWindow):
         self._ffmpeg_ok_result = None    
 
         # cached duration for UI-thread safety
-        self._media_duration = 0.0    
+        self._media_duration = 0.0  
+        # cached FPS for analyzer metrics
+        self._media_fps = 0.0  
 
         # --- Main content area ---
         """ 
@@ -421,6 +423,7 @@ class AuraClipApp(QMainWindow):
         self.current_file = file_path  
         info = self.get_media_info(self.current_file)
         self._media_duration = float(info.get("duration", 0.0)) if info else 0.0
+        self._media_fps = float(info.get("fps", 0.0)) if info else 0.0
 
         # load into player
         self.player.setSource(QUrl.fromLocalFile(self.current_file))
@@ -602,6 +605,7 @@ class AuraClipApp(QMainWindow):
             backend_fn,
             self.current_file,
             27.0,  # threshold ; currently ignored by AI stub 
+            self._media_fps # fps passed into analyzer
         )
         self._detect_worker.moveToThread(self._detect_thread)
 
@@ -699,6 +703,7 @@ class AuraClipApp(QMainWindow):
                         "fps": sd.get("fps", 0.0),
                         "threshold": sd.get("threshold", threshold),
                         "source": sd.get("source", "unknown"),
+                        "motion_proxy": sd.get("motion_proxy", 0.0),
                     }
                     rows.append(row)
 

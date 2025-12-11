@@ -17,6 +17,9 @@ from .scene_types import SceneDatum, AnalyzerResult
 def run_ai_detection(
     filepath: str,
     threshold: float = 0.0,
+    fps: float | None = None,   # 'fps' is accepted to match the PySceneDetect analyzer signature;
+                                # it will be useful once a real AI model is plugged in.
+
     report=None,
 ) -> AnalyzerResult:
     """
