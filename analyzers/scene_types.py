@@ -18,7 +18,7 @@ class SceneDatum(TypedDict):
     threshold: float     # detector threshold value used
     source: str          # "pyscenedetect" or "ai"
     motion_proxy: float  # placeholder motion indicator: 1 / max(0.1, duration_s)
-
+    highlight_score: float  # v1 heuristic score (0.0 - 1.0) derived from proxies
 
 class AnalyzerResult(TypedDict, total=False):
     """

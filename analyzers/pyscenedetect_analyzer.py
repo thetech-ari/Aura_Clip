@@ -41,6 +41,27 @@ except Exception:
         SCENEDETECT_AVAILABLE = False
         SCENEDETECT_API = None
 
+def compute_highlight_score(duration_s: float, motion_proxy: float) -> float:
+    """
+    Iteration 3: heuristic highlight score (NOT AI yet).
+
+    We normalize motion_proxy into 0..1 range (cap at 10),
+    and favor shorter scenes slightly (often indicates a larger visual delta).
+
+    This is intentionally simple and explainable so it can be replaced in iteration 4
+    by learned weights or real motion/audio features.
+    """
+    # Normalize motion_proxy: duration 0.1 => motion_proxy ~ 10.0 (cap to 10)
+    mp = max(0.0, float(motion_proxy))
+    mp_norm = min(mp, 10.0) / 10.0  # 0..1
+
+    dur = max(0.0, float(duration_s))
+    dur_norm = min(dur, 10.0) / 10.0  # 0..1 (cap duration at 10s for scoring)
+    short_bonus = 1.0 - dur_norm      # shorter => higher score
+
+    score = (0.75 * mp_norm) + (0.25 * short_bonus)
+    # Keep stable formatting for logs/datasets
+    return float(round(score, 4))
 
 def run_pyscenedetect(
     filepath: str,
@@ -116,6 +137,7 @@ def run_pyscenedetect(
 
         # Lightweight motion proxy: shorter scenes → higher proxy value
         motion_proxy = 1.0 / max(0.1, duration_s)
+        highlight_score = compute_highlight_score(duration_s, motion_proxy)
 
         scene_data.append(
             SceneDatum(
@@ -127,6 +149,7 @@ def run_pyscenedetect(
                 threshold=float(threshold),
                 source="pyscenedetect",
                 motion_proxy=motion_proxy,
+                highlight_score=highlight_score,
             )
         )
 

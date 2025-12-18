@@ -704,6 +704,7 @@ class AuraClipApp(QMainWindow):
                         "threshold": sd.get("threshold", threshold),
                         "source": sd.get("source", "unknown"),
                         "motion_proxy": sd.get("motion_proxy", 0.0),
+                        "highlight_score": sd.get("highlight_score", 0.0),
                     }
                     rows.append(row)
 
