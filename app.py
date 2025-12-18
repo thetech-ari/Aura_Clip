@@ -652,30 +652,65 @@ class AuraClipApp(QMainWindow):
             self.scene_list.clear()
 
             if not scenes:
-                # Handle no-detection case cleanly
-                placeholder = QListWidgetItem("No scenes detected.")
-                placeholder.setFlags(placeholder.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
-                self.scene_list.addItem(placeholder) 
-                msg = f"No scenes found | threshold={threshold} | elapsed={elapsed_ms:.1f} ms"
-                print(msg)                      # console record for empirical logs
-                self.status.showMessage(msg, 6000)    
+                self.scene_list.addItem(QListWidgetItem("No scenes detected."))
+                self.status.showMessage("No scenes detected.", 4000)
                 return
             
             # Grab media duration to keep times within range                   
             duration = float(self._media_duration) or 0.0 
 
-                # Populate list with checkable items + store raw (start_s, end_s)
-            for i, (start, end) in enumerate(scenes, start=1):
-                start_s = self._to_seconds(start)
-                end_s   = self._to_seconds(end)
-                # Clamp for safety/consistency                                   
-                if duration > 0:
-                    start_s, end_s = self._clamp_range(start_s, end_s, duration)  
-                score = score_by_idx.get(i - 1, 0.0)  # scene_idx is 0-based, i is 1-based
-                label = f"Scene {i} | Score {score:.2f} | {self.format_time(start_s)} → {self.format_time(end_s)}"
+            # --- Iteration 3 UX: sort scenes by highlight_score (highest first) ---
+            # We prefer scene_data because it contains highlight_score + normalized values.
+            display_items = []
+
+            if scene_data:
+                # Build rows from scene_data so we can sort by highlight_score
+                for sd in scene_data:
+                    try:
+                        scene_idx = int(sd.get("scene_idx", 0))
+                        start_s = float(sd.get("start_s", 0.0))
+                        end_s = float(sd.get("end_s", 0.0))
+                        score = float(sd.get("highlight_score", 0.0))
+                    except Exception:
+                        continue
+
+                    # Clamp for safety/consistency
+                    if duration > 0:
+                        start_s, end_s = self._clamp_range(start_s, end_s, duration)
+
+                    display_items.append((scene_idx, start_s, end_s, score))
+
+                # Sort: highest score first, then earlier start time for stability
+                display_items.sort(key=lambda x: (-x[3], x[1]))
+
+            else:
+                # Fallback: no scene_data, so we keep original order with score=0.0
+                for idx, (start, end) in enumerate(scenes):
+                    start_s = self._to_seconds(start)
+                    end_s = self._to_seconds(end)
+
+                    if duration > 0:
+                        start_s, end_s = self._clamp_range(start_s, end_s, duration)
+
+                    display_items.append((idx, start_s, end_s, 0.0))
+
+            # Populate the UI list using the sorted display_items
+            for rank, (scene_idx, start_s, end_s, score) in enumerate(display_items, start=1):
+                # rank = position in sorted list; scene_idx = original scene number (0-based)
+                label = (
+                    f"{rank:02d}. Scene {scene_idx + 1} | "
+                    f"Score {score:.2f} | "
+                    f"{self.format_time(start_s)} → {self.format_time(end_s)}"
+                )
                 item = QListWidgetItem(label)
                 item.setCheckState(Qt.CheckState.Unchecked)
-                item.setData(Qt.ItemDataRole.UserRole, {"start_s": start_s, "end_s": end_s, "score": score})
+
+                # Export + seek logic relies on this:
+                item.setData(Qt.ItemDataRole.UserRole, (start_s, end_s))
+
+                # store extra metadata (doesn’t affect export)
+                item.setData(int(Qt.ItemDataRole.UserRole) + 1, {"scene_idx": scene_idx, "score": score})
+
                 self.scene_list.addItem(item)
 
             # --- Metrics output 
