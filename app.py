@@ -50,6 +50,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QPushButton, QSlider, QStyle,
     QProgressBar, QLabel
 )
+from PyQt6.QtGui import QAction
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
@@ -255,10 +256,8 @@ class AuraClipApp(QMainWindow):
         t.addWidget(self.btn_play)
         t.addWidget(self.btn_fwd)
         t.addWidget(self.seek, stretch=1)
-        left_v.addWidget(transport)
-        t.addWidget(self.seek, stretch=1)
         t.addWidget(self.time_label)
-
+        left_v.addWidget(transport)
 
         # Right: scenes list (checkable items; export only the checked ones)
         self.scene_list = QListWidget(self.container)           
@@ -309,6 +308,12 @@ class AuraClipApp(QMainWindow):
         pysd_action.triggered.connect(lambda: self.set_mode(DetectionMode.PYSDETECT))
         ai_action.triggered.connect(lambda: self.set_mode(DetectionMode.AI_EXPERIMENTAL))
 
+        # Top Highlights filter toggle 
+        self.top_highlights_only = False
+        self.top_highlights_action = QAction("Show Top Highlights Only", self)
+        self.top_highlights_action.setCheckable(True)
+        self.top_highlights_action.setChecked(False)
+        self.top_highlights_action.triggered.connect(self._toggle_top_highlights)
 
         # Tools Menu (Detect / Export buttons)
         tools_menu = menubar.addMenu("Tools")
@@ -319,10 +324,14 @@ class AuraClipApp(QMainWindow):
         self.export_action = tools_menu.addAction("Export Clips")
         self.export_action.triggered.connect(self.export_clips)
 
+        # Top Highlights filter toggle ---
+        tools_menu.addSeparator()
+        tools_menu.addAction(self.top_highlights_action)
+
          # Disabled at startup until a file is loaded
         self.detect_action.setEnabled(False)                        
-        self.export_action.setEnabled(False)                        
-
+        self.export_action.setEnabled(False)  
+            
         # Settings Menu
         settings_menu = menubar.addMenu("Settings")
         settings_action = settings_menu.addAction("Preferences")
@@ -650,6 +659,8 @@ class AuraClipApp(QMainWindow):
             # structured scene metrics from analyzer
             scene_data = payload.get("scene_data", [])
 
+            self.current_scene_data = scene_data
+
             # Map scene_idx -> highlight_score for UI labels
             score_by_idx = {}
             try:
@@ -966,6 +977,71 @@ class AuraClipApp(QMainWindow):
         self.progress.setVisible(False)                                                
         self.progress.setRange(0, 1)                                                  
         self.progress.setValue(0)   
+
+    def _toggle_top_highlights(self, checked: bool) -> None:
+        """
+        Iteration 3 UX: Toggle UI-only filter for showing only high-scoring scenes.
+        """
+        self.top_highlights_only = bool(checked)
+        self._rebuild_scene_list()
+        state = "ON" if checked else "OFF"
+        self.status.showMessage(f"Top Highlights Only: {state}", 2500)
+
+
+    def _rebuild_scene_list(self) -> None:
+        """
+        Rebuild scene list using cached detection results.
+        Applies sorting by highlight_score and optional filtering.
+        """
+        self.scene_list.clear()
+
+        scenes = getattr(self, "current_scenes", None) or []
+        scene_data = getattr(self, "current_scene_data", None) or []
+
+        if not scenes and not scene_data:
+            self.scene_list.addItem(QListWidgetItem("No scenes detected."))
+            return
+
+        threshold = 0.60  # UI-only threshold for "top highlights"
+        display_items = []
+
+        if scene_data:
+            for sd in scene_data:
+                try:
+                    scene_idx = int(sd.get("scene_idx", 0))
+                    start_s = float(sd.get("start_s", 0.0))
+                    end_s = float(sd.get("end_s", 0.0))
+                    score = float(sd.get("highlight_score", 0.0))
+                except Exception:
+                    continue
+
+                if self.top_highlights_only and score < threshold:
+                    continue
+
+                if getattr(self, "_media_duration_ms", 0) > 0:
+                    dur_s = self._media_duration_ms / 1000.0
+                    start_s, end_s = self._clamp_range(start_s, end_s, dur_s)
+
+                display_items.append((scene_idx, start_s, end_s, score))
+
+            display_items.sort(key=lambda x: (-x[3], x[1]))
+
+        else:
+            for idx, (start, end) in enumerate(scenes):
+                start_s = self._to_seconds(start)
+                end_s = self._to_seconds(end)
+                display_items.append((idx, start_s, end_s, 0.0))
+
+        for rank, (scene_idx, start_s, end_s, score) in enumerate(display_items, start=1):
+            label = (
+                f"{rank:02d}. Scene {scene_idx + 1} | "
+                f"Score {score:.2f} | "
+                f"{self.format_time(start_s)} → {self.format_time(end_s)}"
+            )
+            item = QListWidgetItem(label)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, (start_s, end_s))
+            self.scene_list.addItem(item)
 
     def export_clips(self):
         """
