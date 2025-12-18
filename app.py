@@ -244,11 +244,21 @@ class AuraClipApp(QMainWindow):
         self.seek = QSlider(Qt.Orientation.Horizontal)
         self.seek.setRange(0, 1000)  # map 0..1000 to 0..duration
 
+        self.time_label = QLabel("00:00 / 00:00")
+        self.time_label.setMinimumWidth(110)  # keeps UI from jumping as time changes
+        self.time_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        # Track "stop at scene end" behavior
+        self._scene_stop_ms = None
+
         t.addWidget(self.btn_back)
         t.addWidget(self.btn_play)
         t.addWidget(self.btn_fwd)
         t.addWidget(self.seek, stretch=1)
         left_v.addWidget(transport)
+        t.addWidget(self.seek, stretch=1)
+        t.addWidget(self.time_label)
+
 
         # Right: scenes list (checkable items; export only the checked ones)
         self.scene_list = QListWidget(self.container)           
@@ -823,6 +833,8 @@ class AuraClipApp(QMainWindow):
     # Cache media duration (ms) for consistent slider math
     def _on_duration(self, dur_ms: int):
         self._media_duration_ms = max(0, dur_ms)
+        # Update time label (keep current position, refresh total)
+        self._update_time_label(self.player.position())
 
     # Update slider to reflect current playback position (no feedback loop)
     def _on_position(self, pos_ms: int):
@@ -833,32 +845,104 @@ class AuraClipApp(QMainWindow):
             self.seek.setValue(int(ratio * 1000))
             self.seek.blockSignals(False)
 
+        # Update time label every tick
+        self._update_time_label(pos_ms)
+
+        # scene end-stop is set, pause when we pass it
+        if self._scene_stop_ms is not None and pos_ms >= self._scene_stop_ms:
+            self.player.pause()
+            self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+            self.status.showMessage("Reached scene end (auto-paused).", 2500)
+            self._scene_stop_ms = None
+
+    def _update_time_label(self, pos_ms: int) -> None:
+        """
+        Shows playback time as: MM:SS / MM:SS (or HH:MM:SS when long).
+        Uses your existing format_time(seconds) helper.
+        """
+        pos_s = max(0.0, float(pos_ms) / 1000.0)
+        dur_s = max(0.0, float(self._media_duration_ms) / 1000.0)
+        self.time_label.setText(f"{self.format_time(pos_s)} / {self.format_time(dur_s)}")
+
 # -- Scene List Click Handlers --
     # single click: seek to a scene's start on  (don't autoplay)
-    def _jump_to_scene_start(self, item):
-        data = item.data(Qt.ItemDataRole.UserRole)
-        if not data:
+    def _jump_to_scene_start(self, item: QListWidgetItem) -> None:
+    # """Seek preview player to the start of the selected scene (does not auto-play)."""
+        if not item:
             return
-        start_s, _ = data
-        # Clamp & seek
-        pos = max(0, int(float(start_s) * 1000))
-        self.player.pause()
-        self.player.setPosition(pos)
-        # Set play button icon back to "Play"
-        self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
-        self.status.showMessage(f"Jumped to {start_s:.2f}s.", 2000)
+
+        data = item.data(Qt.ItemDataRole.UserRole)
+
+        # Support both tuple (start_s, end_s) and dict {"start_s":..., "end_s":...}
+        try:
+            if isinstance(data, dict):
+                start_s = float(data.get("start_s", 0.0))
+                end_s = float(data.get("end_s", start_s))
+            else:
+                start_s, end_s = data  # expected tuple
+                start_s = float(start_s)
+                end_s = float(end_s)
+        except Exception:
+            self.status.showMessage("Could not read scene timing data.", 3000)
+            return
+
+        # Clamp if we know duration
+        if getattr(self, "_media_duration_ms", 0) > 0:
+            duration_s = float(self._media_duration_ms) / 1000.0
+            start_s, end_s = self._clamp_range(start_s, end_s, duration_s)
+
+        # Set auto-stop point (end of scene)
+        self._scene_stop_ms = int(end_s * 1000)
+
+        # Seek player
+        self.player.setPosition(int(start_s * 1000))
+
+        self.status.showMessage(
+            f"Jumped to {start_s:.2f}s (scene ends at {end_s:.2f}s).",
+            2500
+        )
 
     # double click: seek & play on 
-    def _play_from_scene_start(self, item):
-        data = item.data(Qt.ItemDataRole.UserRole)
-        if not data:
+    def _play_from_scene_start(self, item: QListWidgetItem) -> None:
+    # """Seek preview player to the start of the selected scene and start playback."""
+        if not item:
             return
-        start_s, _ = data
-        pos = max(0, int(float(start_s) * 1000))
-        self.player.setPosition(pos)
+
+        data = item.data(Qt.ItemDataRole.UserRole)
+
+        # Support both tuple (start_s, end_s) and dict {"start_s":..., "end_s":...}
+        try:
+            if isinstance(data, dict):
+                start_s = float(data.get("start_s", 0.0))
+                end_s = float(data.get("end_s", start_s))
+            else:
+                start_s, end_s = data  # expected tuple
+                start_s = float(start_s)
+                end_s = float(end_s)
+        except Exception:
+            self.status.showMessage("Could not read scene timing data.", 3000)
+            return
+
+        # Clamp if we know duration
+        if getattr(self, "_media_duration_ms", 0) > 0:
+            duration_s = float(self._media_duration_ms) / 1000.0
+            start_s, end_s = self._clamp_range(start_s, end_s, duration_s)
+
+        # Set auto-stop point (end of scene)
+        self._scene_stop_ms = int(end_s * 1000)
+
+        # Seek then play
+        self.player.setPosition(int(start_s * 1000))
         self.player.play()
+
+        # Update play button icon (optional but consistent UX)
         self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
-        self.status.showMessage(f"Playing from {start_s:.2f}s.", 2000)
+
+        self.status.showMessage(
+            f"Playing scene: {start_s:.2f}s → {end_s:.2f}s (auto-stop).",
+            2500
+        )
+
 
 # --- Progress Bar Helpers ---
 
