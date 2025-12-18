@@ -640,6 +640,14 @@ class AuraClipApp(QMainWindow):
             # structured scene metrics from analyzer
             scene_data = payload.get("scene_data", [])
 
+            # Map scene_idx -> highlight_score for UI labels
+            score_by_idx = {}
+            try:
+                for sd in scene_data:
+                    score_by_idx[int(sd.get("scene_idx", 0))] = float(sd.get("highlight_score", 0.0))
+            except Exception:
+                score_by_idx = {}
+
             self.current_scenes = scenes
             self.scene_list.clear()
 
@@ -663,10 +671,11 @@ class AuraClipApp(QMainWindow):
                 # Clamp for safety/consistency                                   
                 if duration > 0:
                     start_s, end_s = self._clamp_range(start_s, end_s, duration)  
-                label = f"Scene {i}: {self.format_time(start_s)} → {self.format_time(end_s)}"
+                score = score_by_idx.get(i - 1, 0.0)  # scene_idx is 0-based, i is 1-based
+                label = f"Scene {i} | Score {score:.2f} | {self.format_time(start_s)} → {self.format_time(end_s)}"
                 item = QListWidgetItem(label)
                 item.setCheckState(Qt.CheckState.Unchecked)
-                item.setData(Qt.ItemDataRole.UserRole, (start_s, end_s))
+                item.setData(Qt.ItemDataRole.UserRole, {"start_s": start_s, "end_s": end_s, "score": score})
                 self.scene_list.addItem(item)
 
             # --- Metrics output 
