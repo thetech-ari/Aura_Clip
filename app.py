@@ -302,7 +302,7 @@ class AuraClipApp(QMainWindow):
 
         manual_action = mode_menu.addAction("Manual")
         pysd_action = mode_menu.addAction("PySceneDetect")
-        ai_action = mode_menu.addAction("AI (Experimental)")
+        ai_action = mode_menu.addAction("AI")
 
         manual_action.triggered.connect(lambda: self.set_mode(DetectionMode.MANUAL))
         pysd_action.triggered.connect(lambda: self.set_mode(DetectionMode.PYSDETECT))
@@ -310,7 +310,7 @@ class AuraClipApp(QMainWindow):
 
         # Top Highlights filter toggle 
         self.top_highlights_only = False
-        self.top_highlights_action = QAction("Show Top Highlights Only", self)
+        self.top_highlights_action = QAction("Rank Scenes by Score", self)
         self.top_highlights_action.setCheckable(True)
         self.top_highlights_action.setChecked(False)
         self.top_highlights_action.triggered.connect(self._toggle_top_highlights)
@@ -376,7 +376,7 @@ class AuraClipApp(QMainWindow):
         if settings.detection_mode is DetectionMode.PYSDETECT:
             text = "Detection Mode: PySceneDetect"
         elif settings.detection_mode is DetectionMode.AI_EXPERIMENTAL:
-            text = "Detection Mode: AI (Experimental)"
+            text = "Detection Mode: AI"
         else:
             text = "Detection Mode: Manual"
         self.mode_label.setText(text)  
@@ -598,7 +598,7 @@ class AuraClipApp(QMainWindow):
 
         if mode is DetectionMode.AI_EXPERIMENTAL:
             backend_fn = run_ai_detection
-            backend_label = "AI (Experimental)"
+            backend_label = "AI"
         else:
             # For now, MANUAL falls back to PySceneDetect behavior too
             if not SCENEDETECT_AVAILABLE:
@@ -680,59 +680,9 @@ class AuraClipApp(QMainWindow):
             # Grab media duration to keep times within range                   
             duration = float(self._media_duration) or 0.0 
 
-            # --- Iteration 3 UX: sort scenes by highlight_score (highest first) ---
-            # We prefer scene_data because it contains highlight_score + normalized values.
-            display_items = []
-
-            if scene_data:
-                # Build rows from scene_data so we can sort by highlight_score
-                for sd in scene_data:
-                    try:
-                        scene_idx = int(sd.get("scene_idx", 0))
-                        start_s = float(sd.get("start_s", 0.0))
-                        end_s = float(sd.get("end_s", 0.0))
-                        score = float(sd.get("highlight_score", 0.0))
-                    except Exception:
-                        continue
-
-                    # Clamp for safety/consistency
-                    if duration > 0:
-                        start_s, end_s = self._clamp_range(start_s, end_s, duration)
-
-                    display_items.append((scene_idx, start_s, end_s, score))
-
-                # Sort: highest score first, then earlier start time for stability
-                display_items.sort(key=lambda x: (-x[3], x[1]))
-
-            else:
-                # Fallback: no scene_data, so we keep original order with score=0.0
-                for idx, (start, end) in enumerate(scenes):
-                    start_s = self._to_seconds(start)
-                    end_s = self._to_seconds(end)
-
-                    if duration > 0:
-                        start_s, end_s = self._clamp_range(start_s, end_s, duration)
-
-                    display_items.append((idx, start_s, end_s, 0.0))
-
-            # Populate the UI list using the sorted display_items
-            for rank, (scene_idx, start_s, end_s, score) in enumerate(display_items, start=1):
-                # rank = position in sorted list; scene_idx = original scene number (0-based)
-                label = (
-                    f"{rank:02d}. Scene {scene_idx + 1} | "
-                    f"Score {score:.2f} | "
-                    f"{self.format_time(start_s)} → {self.format_time(end_s)}"
-                )
-                item = QListWidgetItem(label)
-                item.setCheckState(Qt.CheckState.Unchecked)
-
-                # Export + seek logic relies on this:
-                item.setData(Qt.ItemDataRole.UserRole, (start_s, end_s))
-
-                # store extra metadata (doesn’t affect export)
-                item.setData(int(Qt.ItemDataRole.UserRole) + 1, {"scene_idx": scene_idx, "score": score})
-
-                self.scene_list.addItem(item)
+            # --- Iteration 2: Use _rebuild_scene_list() for consistent filtering ---
+            # This ensures the "Rank Scenes" filter toggle works properly
+            self._rebuild_scene_list()
 
             # --- Metrics output 
             msg = f"Detected {len(scenes)} scene(s) | Threshold={threshold} | {elapsed_ms:.1f} ms"
@@ -770,6 +720,8 @@ class AuraClipApp(QMainWindow):
                         "source": sd.get("source", "unknown"),
                         "motion_proxy": sd.get("motion_proxy", 0.0),
                         "highlight_score": sd.get("highlight_score", 0.0),
+                        "audio_energy": sd.get("audio_energy", 0.0),
+                        "ai_detections": sd.get("ai_detections", 0.0),
                     }
                     rows.append(row)
 
@@ -783,13 +735,15 @@ class AuraClipApp(QMainWindow):
         self._detect_worker.finished.connect(self._detect_worker.deleteLater)  
         self._detect_thread.finished.connect(self._detect_thread.deleteLater)  
 
-        # Failsafe: if something goes wrong and we never get finished, unfreeze UI  
-        QTimer.singleShot(60000, lambda: (                                            
-            self._progress_done("Detection timed out."),                               
-            QApplication.restoreOverrideCursor(),                                     
-            self.detect_action.setEnabled(True),                                      
-            self.export_action.setEnabled(bool(self.current_file))                    
-        ))                                                                            
+        # Failsafe: if something goes wrong and we never get finished, unfreeze UI
+        # AI mode needs longer timeout due to YOLO inference (2-3 min for 50 scenes)
+        timeout_ms = 180000 if settings.detection_mode == DetectionMode.AI_EXPERIMENTAL else 60000
+        QTimer.singleShot(timeout_ms, lambda: (
+            self._progress_done("Detection timed out."),
+            QApplication.restoreOverrideCursor(),
+            self.detect_action.setEnabled(True),
+            self.export_action.setEnabled(bool(self.current_file))
+        ))                                                                          
 
         self._detect_thread.start()  
 
@@ -980,12 +934,16 @@ class AuraClipApp(QMainWindow):
 
     def _toggle_top_highlights(self, checked: bool) -> None:
         """
-        Iteration 3 UX: Toggle UI-only filter for showing only high-scoring scenes.
+        Iteration 2: Toggle scene ranking by highlight score.
+        When OFF: Scenes shown in chronological order
+        When ON: Scenes sorted by score (highest first)
         """
         self.top_highlights_only = bool(checked)
         self._rebuild_scene_list()
-        state = "ON" if checked else "OFF"
-        self.status.showMessage(f"Top Highlights Only: {state}", 2500)
+        if checked:
+            self.status.showMessage("Scenes ranked by score (highest first)", 2500)
+        else:
+            self.status.showMessage("Scenes shown in chronological order", 2500)
 
 
     def _rebuild_scene_list(self) -> None:
@@ -1002,7 +960,6 @@ class AuraClipApp(QMainWindow):
             self.scene_list.addItem(QListWidgetItem("No scenes detected."))
             return
 
-        threshold = 0.60  # UI-only threshold for "top highlights"
         display_items = []
 
         if scene_data:
@@ -1015,16 +972,19 @@ class AuraClipApp(QMainWindow):
                 except Exception:
                     continue
 
-                if self.top_highlights_only and score < threshold:
-                    continue
-
                 if getattr(self, "_media_duration_ms", 0) > 0:
                     dur_s = self._media_duration_ms / 1000.0
                     start_s, end_s = self._clamp_range(start_s, end_s, dur_s)
 
                 display_items.append((scene_idx, start_s, end_s, score))
 
-            display_items.sort(key=lambda x: (-x[3], x[1]))
+            # Iteration 2: Only sort by score when "Rank Scenes" is toggled ON
+            if self.top_highlights_only:
+                # Sort by score (highest first), then by start time
+                display_items.sort(key=lambda x: (-x[3], x[1]))
+            else:
+                # Keep chronological order (sort by start time only)
+                display_items.sort(key=lambda x: x[1])
 
         else:
             for idx, (start, end) in enumerate(scenes):

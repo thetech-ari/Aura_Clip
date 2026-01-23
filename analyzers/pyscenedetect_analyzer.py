@@ -209,6 +209,7 @@ def run_pyscenedetect(
                 motion_proxy=motion_proxy,
                 highlight_score=highlight_score,
                 audio_energy=audio_energy,
+                ai_detections=0.0,  # PySceneDetect mode doesn't use AI
             )
         )
 
