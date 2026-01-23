@@ -4,7 +4,7 @@ from enum import Enum, auto
 class DetectionMode(Enum):
     MANUAL = auto()          # user-only cuts (future); detects nothing
     PYSDETECT = auto()       # current, stable path: PySceneDetect
-    AI_EXPERIMENTAL = auto() # placeholder for Iteration 3 model
+    AI_EXPERIMENTAL = auto() # YOLOv8 object detection + audio analysis
 
 @dataclass
 class AppSettings:

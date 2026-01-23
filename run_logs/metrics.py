@@ -91,17 +91,62 @@ def append_rows(kind: str, rows: List[Dict]) -> None:
         base_name = kind
 
     csv_path = os.path.join(runs_dir, f"{base_name}.csv")
-    write_header = not os.path.exists(csv_path)
-
-    # Use the keys of the first row as header; assume all rows share schema.
-    fieldnames = list(rows[0].keys())
+    
+    # Iteration 2 Fix: Dynamically merge columns when new fields are added
+    # Read existing headers if file exists
+    existing_fieldnames = []
+    if os.path.exists(csv_path):
+        try:
+            with open(csv_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                existing_fieldnames = list(reader.fieldnames or [])
+        except Exception:
+            existing_fieldnames = []
+    
+    # Get fieldnames from new rows
+    new_fieldnames = list(rows[0].keys())
+    
+    # Merge: keep existing order, append any new fields at the end
+    if existing_fieldnames:
+        merged_fieldnames = existing_fieldnames[:]
+        for field in new_fieldnames:
+            if field not in merged_fieldnames:
+                merged_fieldnames.append(field)
+        fieldnames = merged_fieldnames
+        write_header = False  # File exists, don't overwrite header
+    else:
+        fieldnames = new_fieldnames
+        write_header = True  # New file, write header
 
     try:
-        with open(csv_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if write_header:
+        # If we added new columns, rewrite the entire CSV with updated header
+        if existing_fieldnames and set(new_fieldnames) != set(existing_fieldnames):
+            # Read all existing rows
+            existing_rows = []
+            if os.path.exists(csv_path):
+                with open(csv_path, "r", newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    existing_rows = list(reader)
+            
+            # Rewrite with merged headers + all rows (old + new)
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
-            for row in rows:
-                writer.writerow(row)
+                for row in existing_rows:
+                    # Fill missing fields with empty string
+                    filled_row = {field: row.get(field, "") for field in fieldnames}
+                    writer.writerow(filled_row)
+                for row in rows:
+                    filled_row = {field: row.get(field, "") for field in fieldnames}
+                    writer.writerow(filled_row)
+        else:
+            # Normal append (no new columns)
+            with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if write_header:
+                    writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+                    
     except Exception as e:
         print(f"[LOGGING WARNING] Could not update {csv_path}: {e}")
