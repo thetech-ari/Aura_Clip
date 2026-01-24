@@ -92,7 +92,7 @@ def append_rows(kind: str, rows: List[Dict]) -> None:
 
     csv_path = os.path.join(runs_dir, f"{base_name}.csv")
     
-    # Iteration 2 Fix: Dynamically merge columns when new fields are added
+    # Dynamically merge columns when new fields are added
     # Read existing headers if file exists
     existing_fieldnames = []
     if os.path.exists(csv_path):
@@ -119,9 +119,20 @@ def append_rows(kind: str, rows: List[Dict]) -> None:
         write_header = True  # New file, write header
 
     try:
-        # If we added new columns, rewrite the entire CSV with updated header
-        if existing_fieldnames and set(new_fieldnames) != set(existing_fieldnames):
-            # Read all existing rows
+        # Check if schema has evolved (new columns added)
+        schema_changed = (existing_fieldnames and 
+                          set(new_fieldnames) != set(existing_fieldnames))
+        
+        if schema_changed:
+            # ===== Log schema changes for debugging =====
+            # When new metrics are added, log which columns were added
+            # This helps track the evolution of the dataset schema
+            new_columns = set(new_fieldnames) - set(existing_fieldnames)
+            print(f"[Fix #5: CSV Schema Update] Adding new columns to {base_name}.csv:")
+            print(f"  New fields: {', '.join(sorted(new_columns))}")
+            print(f"  Total columns: {len(existing_fieldnames)} → {len(fieldnames)}")
+            
+            # Read all existing rows (preserve historical data)
             existing_rows = []
             if os.path.exists(csv_path):
                 with open(csv_path, "r", newline="", encoding="utf-8") as f:
@@ -132,15 +143,20 @@ def append_rows(kind: str, rows: List[Dict]) -> None:
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
+                
+                # Write old rows with missing fields filled as empty strings
                 for row in existing_rows:
-                    # Fill missing fields with empty string
                     filled_row = {field: row.get(field, "") for field in fieldnames}
                     writer.writerow(filled_row)
+                
+                # Write new rows
                 for row in rows:
                     filled_row = {field: row.get(field, "") for field in fieldnames}
                     writer.writerow(filled_row)
+            
+            print(f"  ✓ Successfully updated {len(existing_rows)} existing rows with new schema")
         else:
-            # Normal append (no new columns)
+            # Schema unchanged: Fast append path (no rewrite needed)
             with open(csv_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 if write_header:
