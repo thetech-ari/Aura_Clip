@@ -191,7 +191,7 @@ class AuraClipApp(QMainWindow):
         super().__init__()
 
         # --- Window chrome & state ---
-        self.setWindowTitle("Aura Clip - Iteration 2")
+        self.setWindowTitle("Aura Clip - Iteration 3")
         self.setGeometry(200, 200, 900, 600)
 
         # Track the currently selected file path + detected scenes in memory
@@ -259,13 +259,58 @@ class AuraClipApp(QMainWindow):
         t.addWidget(self.time_label)
         left_v.addWidget(transport)
 
-        # Right: scenes list (checkable items; export only the checked ones)
-        self.scene_list = QListWidget(self.container)           
-        self.scene_list.setFixedWidth(350)                  
-        self.layout.addWidget(self.scene_list) 
-        # clicking a scene seeks to its start; double-click plays from there   
-        self.scene_list.itemClicked.connect(self._jump_to_scene_start)       
-        self.scene_list.itemDoubleClicked.connect(self._play_from_scene_start)             
+        # Usability improvement: Selection counter label + Select All/Deselect All buttons
+        
+        # Right panel: Scene list with selection controls
+        right_panel = QWidget(self.container)
+        right_v = QVBoxLayout(right_panel)
+        right_v.setContentsMargins(0, 0, 0, 0)
+        
+        # Selection counter label: Shows "X scenes selected"
+        self.selection_label = QLabel("0 scenes selected", right_panel)
+        self.selection_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.selection_label.setStyleSheet(
+            "font-weight: bold; "
+            "padding: 8px; "
+            "background-color: #e8f4f8; "
+            "border: 1px solid #b8d4e0; "
+            "border-radius: 4px; "
+            "color: #2c5f7c;"
+        )
+        right_v.addWidget(self.selection_label)
+        
+        # Batch selection buttons: Select All / Deselect All
+        selection_buttons = QWidget(right_panel)
+        selection_btn_layout = QHBoxLayout(selection_buttons)
+        selection_btn_layout.setContentsMargins(0, 5, 0, 5)
+        
+        self.btn_select_all = QPushButton("✓ Select All", selection_buttons)
+        self.btn_deselect_all = QPushButton("✗ Deselect All", selection_buttons)
+        
+        self.btn_select_all.clicked.connect(self._select_all_scenes)
+        self.btn_deselect_all.clicked.connect(self._deselect_all_scenes)
+        
+        # Style buttons for better visibility
+        self.btn_select_all.setStyleSheet("padding: 6px;")
+        self.btn_deselect_all.setStyleSheet("padding: 6px;")
+        
+        selection_btn_layout.addWidget(self.btn_select_all)
+        selection_btn_layout.addWidget(self.btn_deselect_all)
+        right_v.addWidget(selection_buttons)
+        
+        # Scene list (checkable items; export only the checked ones)
+        self.scene_list = QListWidget(right_panel)
+        self.scene_list.setFixedWidth(350)
+        right_v.addWidget(self.scene_list, stretch=1)
+        
+        self.layout.addWidget(right_panel)
+        
+        # clicking a scene seeks to its start; double-click plays from there
+        self.scene_list.itemClicked.connect(self._jump_to_scene_start)
+        self.scene_list.itemDoubleClicked.connect(self._play_from_scene_start)
+        
+        # Update selection counter whenever checkboxes change
+        self.scene_list.itemChanged.connect(self._update_selection_count)           
 
         # --- Status Bar ---
         # Displays messages to the user, such as file loaded or task complete.
@@ -339,6 +384,15 @@ class AuraClipApp(QMainWindow):
 
         # Help Menu
         help_menu = menubar.addMenu("Help")
+
+        # Provides quick access to technical term definitions
+        glossary_action = help_menu.addAction("Glossary")
+        glossary_action.setShortcut("F1")  # Standard help key
+        glossary_action.triggered.connect(self.show_glossary)
+        glossary_action.setToolTip("View definitions of technical terms")
+        
+        help_menu.addSeparator()
+        
         about_action = help_menu.addAction("About Aura Clip")
         about_action.triggered.connect(self.show_about)
 
@@ -637,6 +691,18 @@ class AuraClipApp(QMainWindow):
         
         # Finish chain: deliver payload > stop thread > clean up objects
         def on_finished(payload):
+
+            # Stop and delete the timeout timer to prevent false "timed out" messages
+            # ensures the timeout callback never executes for successful completions
+            if hasattr(self, '_detect_timeout_timer') and self._detect_timeout_timer:
+                try:
+                    self._detect_timeout_timer.stop()
+                    self._detect_timeout_timer.deleteLater()
+                except RuntimeError:
+                    pass  # Timer was already deleted by Qt
+                finally:
+                    self._detect_timeout_timer = None
+
             self._progress_done("Detection Complete.")
             self.status.showMessage("Detection Done! Review scenes, then Export", 5000)
             QApplication.restoreOverrideCursor()
@@ -736,16 +802,20 @@ class AuraClipApp(QMainWindow):
         self._detect_thread.finished.connect(self._detect_thread.deleteLater)  
 
         # Failsafe: if something goes wrong and we never get finished, unfreeze UI
-        # AI mode needs longer timeout due to YOLO inference (2-3 min for 50 scenes)
+        # AI mode gets longer timeout due to YOLO inference (2-3 min for 50 scenes)
         timeout_ms = 180000 if settings.detection_mode == DetectionMode.AI_EXPERIMENTAL else 60000
-        QTimer.singleShot(timeout_ms, lambda: (
+        self._detect_timeout_timer = QTimer(self)
+        self._detect_timeout_timer.setSingleShot(True)
+        self._detect_timeout_timer.timeout.connect(lambda: (
             self._progress_done("Detection timed out."),
             QApplication.restoreOverrideCursor(),
             self.detect_action.setEnabled(True),
-            self.export_action.setEnabled(bool(self.current_file))
-        ))                                                                          
+            self.export_action.setEnabled(bool(self.current_file)),
+            setattr(self, '_detect_timeout_timer', None)  # Clear reference after timeout
+        ))
+        self._detect_timeout_timer.start(timeout_ms)
 
-        self._detect_thread.start()  
+        self._detect_thread.start()
 
     # helper to call ffmpeg directly and bubble up stderr if it fails
     def _run_ffmpeg_slice(self, src: str, start_s: float, end_s: float, dst: str) -> tuple[bool, str]:
@@ -907,7 +977,64 @@ class AuraClipApp(QMainWindow):
             f"Playing scene: {start_s:.2f}s → {end_s:.2f}s (auto-stop).",
             2500
         )
+    
+    def _select_all_scenes(self) -> None:
+        """
+        Select all scenes in the list for batch export operations.
+        Improves usability by avoiding tedious manual selection of many scenes.
+        """
+        for idx in range(self.scene_list.count()):
+            item = self.scene_list.item(idx)
+            if item and item.data(Qt.ItemDataRole.UserRole):  # Skip placeholder "No scenes" items
+                item.setCheckState(Qt.CheckState.Checked)
+        self.status.showMessage(f"Selected all {self.scene_list.count()} scenes", 2000)
 
+    def _deselect_all_scenes(self) -> None:
+        """
+        Deselect all scenes in the list.
+        Allows users to quickly clear selections and start fresh.
+        """
+        for idx in range(self.scene_list.count()):
+            item = self.scene_list.item(idx)
+            if item and item.data(Qt.ItemDataRole.UserRole):  # Skip placeholder items
+                item.setCheckState(Qt.CheckState.Unchecked)
+        self.status.showMessage("Cleared all selections", 2000)
+
+    def _update_selection_count(self) -> None:
+        """
+        Update the selection counter label to show checked scene count.
+        Provides immediate visual feedback on what will be exported.
+        Called automatically whenever checkboxes change (itemChanged signal).
+        """
+        count = sum(
+            1 for idx in range(self.scene_list.count())
+            if (self.scene_list.item(idx).checkState() == Qt.CheckState.Checked
+                and self.scene_list.item(idx).data(Qt.ItemDataRole.UserRole))
+        )
+        
+        # Update label with grammatically correct text
+        text = f"{count} scene{'s' if count != 1 else ''} selected"
+        self.selection_label.setText(text)
+        
+        # Visual feedback: Highlight when scenes are selected
+        if count > 0:
+            self.selection_label.setStyleSheet(
+                "font-weight: bold; "
+                "padding: 8px; "
+                "background-color: #d4edda; "  # Green background when selected
+                "border: 1px solid #c3e6cb; "
+                "border-radius: 4px; "
+                "color: #155724;"
+            )
+        else:
+            self.selection_label.setStyleSheet(
+                "font-weight: bold; "
+                "padding: 8px; "
+                "background-color: #e8f4f8; "  # Blue-gray when none selected
+                "border: 1px solid #b8d4e0; "
+                "border-radius: 4px; "
+                "color: #2c5f7c;"
+            )
 
 # --- Progress Bar Helpers ---
 
@@ -1002,6 +1129,9 @@ class AuraClipApp(QMainWindow):
             item.setCheckState(Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, (start_s, end_s))
             self.scene_list.addItem(item)
+
+        # Update selection counter after rebuilding the list
+        self._update_selection_count()
 
     def export_clips(self):
         """
@@ -1105,7 +1235,7 @@ class AuraClipApp(QMainWindow):
 
         # --- 8) Finish chain: UI restore > quit thread > delete objects 
         def on_finished(payload):   # Called automatically when the background export job completes.
-           
+
             # Restores UI controls, shows results, and reports metrics.
             self._progress_done("Export complete.")
             self.status.showMessage("Export done! Clips saved to exports folder", 6000)
@@ -1223,11 +1353,63 @@ class AuraClipApp(QMainWindow):
         QMessageBox.information(
             self,
             "About Aura Clip",
-            "Aura Clip (PP4 Iteration 1 Build)\n\n"
+            "Aura Clip (PP4 Iteration 3 Build)\n\n"
             "Developed by Arianna Miller-Paul (Full Sail University)\n"
-            "This app demonstrates the integration of PyQt6 + MoviePy + PySceneDetect."
+            "Scene detection tool with PySceneDetect + AI-powered highlight ranking.\n\n"
+        "Features: Audio analysis, YOLO object detection, automated export."
         )
         print("Displayed About dialog.")
+
+    def show_glossary(self):
+        """
+        ===== Display in-app glossary of technical terms =====
+        Usability improvement:
+        - Users found terms like "threshold", "highlight score" confusing
+        - This glossary provides clear definitions without leaving the app
+        - Accessible via Help menu → Glossary
+        """
+        glossary_text = """<h3>Aura Clip Glossary</h3>
+
+<p><b>Scene Detection:</b> The process of identifying cuts or transitions in video where content changes significantly (camera angles, locations, action).</p>
+
+<p><b>Threshold:</b> Sensitivity level for detecting scene changes (1-100 scale). 
+<br>• Lower values (10-20) = More sensitive, detects subtle changes, creates more scenes
+<br>• Higher values (30-50) = Less sensitive, only detects major changes, fewer scenes
+<br>• Default: 27 works well for most gameplay videos</p>
+
+<p><b>Highlight Score:</b> Automatic ranking (0.0-1.0) of how "interesting" a scene is.
+<br>• Calculated from: Audio energy (60%) + Duration bonus (40%)
+<br>• Higher score = More likely to be exciting/exportable moment
+<br>• AI mode also includes object detections in scoring</p>
+
+<p><b>Audio Energy:</b> Measure of sound loudness/intensity (RMS) in a scene.
+<br>• Higher values = Louder moments (gunshots, explosions, excitement)
+<br>• Normalized to 0.0-1.0 scale (0 = silent, 1 = very loud)</p>
+
+<p><b>AI Detections:</b> Count of action-related objects found by YOLO AI (people, vehicles, weapons).
+<br>• Higher count = More visible action in the scene
+<br>• Only available in AI detection mode</p>
+
+<p><b>Detection Modes:</b>
+<br>• <b>PySceneDetect:</b> Fast traditional detection (2-5 seconds) using frame content analysis
+<br>• <b>AI Mode:</b> Slower but smarter (2-3 minutes) using YOLO object detection + audio analysis
+<br>• <b>Manual:</b> Currently falls back to PySceneDetect behavior</p>
+
+<p><b>FPS (Frames Per Second):</b> Video playback speed. Standard rates:
+<br>• 24fps = Cinema, 30fps = Standard video, 60fps = Smooth gameplay</p>
+
+<p><b>Export:</b> Save selected scenes as separate MP4 video files to ./exports folder.
+<br>• Only checked scenes are exported
+<br>• Original video quality is preserved</p>
+"""
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Glossary - Technical Terms")
+        msg_box.setTextFormat(Qt.TextFormat.RichText)
+        msg_box.setText(glossary_text)
+        msg_box.setIcon(QMessageBox.Icon.Information)
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg_box.exec()
+        print("[Glossary] Displayed technical term definitions to user.")
 
     def closeEvent(self, event):
         """
