@@ -803,7 +803,28 @@ class AuraClipApp(QMainWindow):
 
         # Failsafe: if something goes wrong and we never get finished, unfreeze UI
         # AI mode gets longer timeout due to YOLO inference (2-3 min for 50 scenes)
-        timeout_ms = 180000 if settings.detection_mode == DetectionMode.AI_EXPERIMENTAL else 60000
+        # Calculate timeout based on video duration
+        video_duration_minutes = self._media_duration / 60.0  # Convert seconds to minutes
+        
+        if video_duration_minutes < 30:
+            # Short videos: Use default timeouts
+            base_timeout_ms = 180000 if settings.detection_mode == DetectionMode.AI_EXPERIMENTAL else 60000
+        else:
+            # Long videos: Scale timeout proportionally
+            # Rule of thumb: 2 seconds per minute of video for PySceneDetect
+            #                10 seconds per minute of video for AI mode
+            if settings.detection_mode == DetectionMode.AI_EXPERIMENTAL:
+                # AI mode: ~10 seconds per minute of video (1 hour = 600 seconds = 10 min timeout)
+                base_timeout_ms = int(video_duration_minutes * 10 * 1000)  # 10 sec/min
+            else:
+                # PySceneDetect mode: ~2 seconds per minute of video (1 hour = 120 seconds = 2 min timeout)
+                base_timeout_ms = int(video_duration_minutes * 2 * 1000)  # 2 sec/min
+        
+        # Add 30-second safety buffer
+        timeout_ms = base_timeout_ms + 30000
+        
+        print(f"[Detection Timeout] Set to {timeout_ms/1000:.0f} seconds for {video_duration_minutes:.1f}-minute video in {settings.detection_mode.name} mode")
+        
         self._detect_timeout_timer = QTimer(self)
         self._detect_timeout_timer.setSingleShot(True)
         self._detect_timeout_timer.timeout.connect(lambda: (
