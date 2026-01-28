@@ -671,6 +671,16 @@ class AuraClipApp(QMainWindow):
         self.detect_action.setEnabled(False)
         self.export_action.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        
+        # Console logging for debugging
+        print(f"\n{'='*60}")
+        print(f"[DETECTION START] Beginning scene detection")
+        print(f"  Backend: {backend_label}")
+        print(f"  File: {os.path.basename(self.current_file)}")
+        print(f"  Duration: {self._media_duration:.2f}s")
+        print(f"  FPS: {self._media_fps:.2f}")
+        print(f"  Threshold: 27.0")
+        print(f"{'='*60}\n")
 
         # Spin up a one-off worker thread for detection
         self._detect_thread = QThread(self)
@@ -682,27 +692,60 @@ class AuraClipApp(QMainWindow):
         )
         self._detect_worker.moveToThread(self._detect_thread)
 
-        def on_progress(payload):                                                   
-            pass  # keep spinner running; nothing else needed                                                      
-        self._detect_worker.progress.connect(on_progress) 
+        def on_progress(payload):
+            # Show detailed progress updates - no timeout tracking needed
+            if not isinstance(payload, dict):
+                return
+                
+            phase = payload.get("phase", "")
+            mode = payload.get("mode", "")
+            
+            if phase == "detect":
+                # Show what's happening at each stage
+                if mode == "start":
+                    self.status.showMessage(f"Starting {backend_label} detection...")
+                    print(f"[PROGRESS] Starting {backend_label} detection")
+                    
+                elif mode == "ai_start":
+                    self.status.showMessage("Loading AI models...")
+                    print("[PROGRESS] Loading AI models...")
+                    
+                elif mode == "ai_model_loaded":
+                    self.status.showMessage("AI models loaded, finding scene cuts...")
+                    print("[PROGRESS] AI models loaded, finding scene cuts...")
+                    
+                elif mode == "ai_analysis_start":
+                    total = payload.get("total_scenes", 0)
+                    self.status.showMessage(f"Found {total} scenes, starting AI analysis...")
+                    print(f"[PROGRESS] Analyzing {total} scenes with AI")
+                    
+                elif mode == "ai_analysis":
+                    done = payload.get("done", 0)
+                    total = payload.get("total", 0)
+                    if total > 0:
+                        percent = int((done / total) * 100)
+                        self.status.showMessage(f"AI analyzing: Scene {done}/{total} ({percent}%)")
+                        # Print every 5 scenes to avoid console spam
+                        if done % 5 == 0 or done == total:
+                            print(f"[PROGRESS] AI analyzing scene {done}/{total} ({percent}%)")
+                            
+                elif mode == "audio_analysis_start":
+                    total = payload.get("total_scenes", 0)
+                    self.status.showMessage(f"Extracting audio from {total} scenes...")
+                    print(f"[PROGRESS] Extracting audio from {total} scenes")
+                    
+                elif mode == "end":
+                    elapsed = payload.get("elapsed_s", 0.0)
+                    self.status.showMessage(f"Detection complete in {elapsed:.1f}s")
+                    print(f"[PROGRESS] Detection complete in {elapsed:.1f}s")
+        
+        self._detect_worker.progress.connect(on_progress)
         
         # Start the worker when thread starts (queued, non-blocking)             
         self._detect_thread.started.connect(self._detect_worker.run, Qt.ConnectionType.QueuedConnection)  
         
-        # Finish chain: deliver payload > stop thread > clean up objects
         def on_finished(payload):
-
-            # Stop and delete the timeout timer to prevent false "timed out" messages
-            # ensures the timeout callback never executes for successful completions
-            if hasattr(self, '_detect_timeout_timer') and self._detect_timeout_timer:
-                try:
-                    self._detect_timeout_timer.stop()
-                    self._detect_timeout_timer.deleteLater()
-                except RuntimeError:
-                    pass  # Timer was already deleted by Qt
-                finally:
-                    self._detect_timeout_timer = None
-
+            # Detection completed - no timeout cleanup needed
             self._progress_done("Detection Complete.")
             self.status.showMessage("Detection Done! Review scenes, then Export", 5000)
             QApplication.restoreOverrideCursor()
@@ -800,43 +843,12 @@ class AuraClipApp(QMainWindow):
         self._detect_worker.finished.connect(self._detect_thread.quit)
         self._detect_worker.finished.connect(self._detect_worker.deleteLater)  
         self._detect_thread.finished.connect(self._detect_thread.deleteLater)  
-
-        # Failsafe: if something goes wrong and we never get finished, unfreeze UI
-        # AI mode gets longer timeout due to YOLO inference (2-3 min for 50 scenes)
-        # Calculate timeout based on video duration
-        video_duration_minutes = self._media_duration / 60.0  # Convert seconds to minutes
         
-        if video_duration_minutes < 30:
-            # Short videos: Use default timeouts
-            base_timeout_ms = 180000 if settings.detection_mode == DetectionMode.AI_EXPERIMENTAL else 60000
-        else:
-            # Long videos: Scale timeout proportionally
-            # Rule of thumb: 2 seconds per minute of video for PySceneDetect
-            #                10 seconds per minute of video for AI mode
-            if settings.detection_mode == DetectionMode.AI_EXPERIMENTAL:
-                # AI mode: ~10 seconds per minute of video (1 hour = 600 seconds = 10 min timeout)
-                base_timeout_ms = int(video_duration_minutes * 10 * 1000)  # 10 sec/min
-            else:
-                # PySceneDetect mode: ~2 seconds per minute of video (1 hour = 120 seconds = 2 min timeout)
-                base_timeout_ms = int(video_duration_minutes * 2 * 1000)  # 2 sec/min
-        
-        # Add 30-second safety buffer
-        timeout_ms = base_timeout_ms + 30000
-        
-        print(f"[Detection Timeout] Set to {timeout_ms/1000:.0f} seconds for {video_duration_minutes:.1f}-minute video in {settings.detection_mode.name} mode")
-        
-        self._detect_timeout_timer = QTimer(self)
-        self._detect_timeout_timer.setSingleShot(True)
-        self._detect_timeout_timer.timeout.connect(lambda: (
-            self._progress_done("Detection timed out."),
-            QApplication.restoreOverrideCursor(),
-            self.detect_action.setEnabled(True),
-            self.export_action.setEnabled(bool(self.current_file)),
-            setattr(self, '_detect_timeout_timer', None)  # Clear reference after timeout
-        ))
-        self._detect_timeout_timer.start(timeout_ms)
+        print(f"[DETECTION] Starting {backend_label} detection (no timeout)")
 
         self._detect_thread.start()
+
+    
 
     # helper to call ffmpeg directly and bubble up stderr if it fails
     def _run_ffmpeg_slice(self, src: str, start_s: float, end_s: float, dst: str) -> tuple[bool, str]:
@@ -879,7 +891,7 @@ class AuraClipApp(QMainWindow):
         pos = max(0, min(self.player.position() + int(delta_sec * 1000), self._media_duration_ms))
         self.player.setPosition(pos)
 
-    # Map slider range [0..1000] to [0..duration_ms] and seek
+    # Map slider range and seek
     def _seek_to_ratio(self, val: int):
         # slider 0..1000 > position 0..duration
         if self._media_duration_ms > 0:
@@ -923,13 +935,13 @@ class AuraClipApp(QMainWindow):
 # -- Scene List Click Handlers --
     # single click: seek to a scene's start on  (don't autoplay)
     def _jump_to_scene_start(self, item: QListWidgetItem) -> None:
-    # """Seek preview player to the start of the selected scene (does not auto-play)."""
+    # Seek preview player to the start of the selected scene (does not auto-play).
         if not item:
             return
 
         data = item.data(Qt.ItemDataRole.UserRole)
 
-        # Support both tuple (start_s, end_s) and dict {"start_s":..., "end_s":...}
+        # Support both tuple (start_s, end_s) and dict {start_s & end_s}
         try:
             if isinstance(data, dict):
                 start_s = float(data.get("start_s", 0.0))
@@ -960,13 +972,13 @@ class AuraClipApp(QMainWindow):
 
     # double click: seek & play on 
     def _play_from_scene_start(self, item: QListWidgetItem) -> None:
-    # """Seek preview player to the start of the selected scene and start playback."""
+    # Seek preview player to the start of the selected scene and start playback."""
         if not item:
             return
 
         data = item.data(Qt.ItemDataRole.UserRole)
 
-        # Support both tuple (start_s, end_s) and dict {"start_s":..., "end_s":...}
+        # Support both tuple (start_s, end_s) and dict {start_s & end_s}
         try:
             if isinstance(data, dict):
                 start_s = float(data.get("start_s", 0.0))
@@ -991,7 +1003,7 @@ class AuraClipApp(QMainWindow):
         self.player.setPosition(int(start_s * 1000))
         self.player.play()
 
-        # Update play button icon (optional but consistent UX)
+        # Play button icon (consistent UX)
         self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
 
         self.status.showMessage(
