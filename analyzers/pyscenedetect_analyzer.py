@@ -169,6 +169,10 @@ def run_pyscenedetect(
     if callable(report):
         report({"phase": "detect", "mode": "end", "elapsed_s": elapsed_s})
 
+    # Let UI know how many scenes were found before starting audio analysis
+    if callable(report):
+        report({"phase": "detect", "mode": "scene_count", "total_scenes": len(scenes)})
+
     # --- Build normalized per-scene metrics ---
     fps_value = 0.0 if fps is None else float(fps)
 
@@ -192,6 +196,15 @@ def run_pyscenedetect(
 
         # Iteration 2: Extract audio energy for this scene segment
         audio_energy = extract_audio_energy(filepath, start_s, end_s)
+
+        # Update UI with current progress (every scene, not just every 5)
+        if callable(report):
+            report({
+                "phase": "detect",
+                "mode": "audio_progress",
+                "done": idx + 1,
+                "total": len(scenes)
+            })
 
         # Lightweight motion proxy: shorter scenes → higher proxy value
         motion_proxy = 1.0 / max(0.1, duration_s)

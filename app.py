@@ -847,6 +847,32 @@ class AuraClipApp(QMainWindow):
                 if mode == "start":
                     self.status.showMessage(f"Starting {backend_label} detection...")
                     print(f"[PROGRESS] Starting {backend_label} detection")
+
+                elif mode == "scene_count":
+                    # PySceneDetect reports total scene count after detection completes
+                    total_scenes = payload.get("total_scenes", 0)
+                    if total_scenes > 0:
+                        self.status.showMessage(
+                            f"Detected {total_scenes} scene(s) - Analyzing highlights..."
+                    )
+                        
+                elif mode == "audio_analysis_start":
+                    # Audio analysis phase (can be slow for long videos)
+                    total_scenes = payload.get("total_scenes", 0)
+                    self.progress.setRange(0, total_scenes)  # Switch to determinate
+                    self.progress.setValue(0)
+                    self.status.showMessage(
+                        f"Analyzing audio for {total_scenes} scene(s)..."
+                    )
+                
+                elif mode == "audio_progress":
+                    # Update progress bar during audio analysis
+                    done = payload.get("done", 0)
+                    total = payload.get("total", 1)
+                    self.progress.setValue(done)
+                    self.status.showMessage(
+                        f"Analyzing audio: scene {done}/{total}..."
+                    )
                     
                 elif mode == "ai_start":
                     self.status.showMessage("Loading AI models...")
@@ -857,19 +883,26 @@ class AuraClipApp(QMainWindow):
                     print("[PROGRESS] AI models loaded, finding scene cuts...")
                     
                 elif mode == "ai_analysis_start":
-                    total = payload.get("total_scenes", 0)
-                    self.status.showMessage(f"Found {total} scenes, starting AI analysis...")
-                    print(f"[PROGRESS] Analyzing {total} scenes with AI")
+                    total_scenes = payload.get("total_scenes", 0)
+                    self.progress.setRange(0, total_scenes)
+                    self.progress.setValue(0)
+                    self.status.showMessage(
+                        f"Running AI analysis on {total_scenes} scene(s)..."
+                    )
+                    print(f"[PROGRESS] Analyzing {total_scenes} scenes with AI")
                     
                 elif mode == "ai_analysis":
                     done = payload.get("done", 0)
-                    total = payload.get("total", 0)
-                    if total > 0:
-                        percent = int((done / total) * 100)
-                        self.status.showMessage(f"AI analyzing: Scene {done}/{total} ({percent}%)")
-                        # Print every 5 scenes to avoid console spam
-                        if done % 5 == 0 or done == total:
-                            print(f"[PROGRESS] AI analyzing scene {done}/{total} ({percent}%)")
+                    total = payload.get("total", 1)
+                    self.progress.setValue(done)
+                    self.status.showMessage(
+                        f"AI analysis: scene {done}/{total}..."
+                    )
+                    print(f"[PROGRESS] AI analyzing scene {done}/{total}")
+
+                elif mode == "ai_complete":
+                    elapsed_s = payload.get("elapsed_s", 0)
+                    self.status.showMessage(f"AI detection complete ({elapsed_s:.1f}s)")
                             
                 elif mode == "audio_analysis_start":
                     total = payload.get("total_scenes", 0)

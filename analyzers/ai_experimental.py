@@ -309,7 +309,7 @@ def run_ai_detection(
         )
         
         # Progress update every 5 scenes
-        if callable(report) and idx % 5 == 0:
+        if callable(report):
             report({
                 "phase": "detect",
                 "mode": "ai_analysis",
