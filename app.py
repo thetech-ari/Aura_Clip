@@ -328,7 +328,7 @@ class AuraClipApp(QMainWindow):
         super().__init__()
 
         # --- Window chrome & state ---
-        self.setWindowTitle("Aura Clip - Iteration 3")
+        self.setWindowTitle("Aura Clip")
         self.setGeometry(200, 200, 900, 600)
 
         # Track the currently selected file path + detected scenes in memory
