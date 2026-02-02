@@ -252,12 +252,21 @@ class AuraClipApp(QMainWindow):
         # Track "stop at scene end" behavior
         self._scene_stop_ms = None
 
+        #scriber setup
         t.addWidget(self.btn_back)
         t.addWidget(self.btn_play)
         t.addWidget(self.btn_fwd)
         t.addWidget(self.seek, stretch=1)
         t.addWidget(self.time_label)
         left_v.addWidget(transport)
+
+        # This makes the detection workflow more visible and intuitive
+        # Button is disabled until a video is loaded
+        self.detect_btn = QPushButton("Detect Scenes", left)
+        self.detect_btn.setMinimumHeight(36)  
+        self.detect_btn.clicked.connect(self.detect_scenes)
+        self.detect_btn.setEnabled(False)  # Disabled until file loaded
+        left_v.addWidget(self.detect_btn)
 
         # Usability improvement: Selection counter label + Select All/Deselect All buttons
         
@@ -284,8 +293,8 @@ class AuraClipApp(QMainWindow):
         selection_btn_layout = QHBoxLayout(selection_buttons)
         selection_btn_layout.setContentsMargins(0, 5, 0, 5)
         
-        self.btn_select_all = QPushButton("✓ Select All", selection_buttons)
-        self.btn_deselect_all = QPushButton("✗ Deselect All", selection_buttons)
+        self.btn_select_all = QPushButton("Select All", selection_buttons)
+        self.btn_deselect_all = QPushButton("Deselect All", selection_buttons)
         
         self.btn_select_all.clicked.connect(self._select_all_scenes)
         self.btn_deselect_all.clicked.connect(self._deselect_all_scenes)
@@ -297,17 +306,24 @@ class AuraClipApp(QMainWindow):
         selection_btn_layout.addWidget(self.btn_select_all)
         selection_btn_layout.addWidget(self.btn_deselect_all)
         right_v.addWidget(selection_buttons)
-        
-        # Scene list (checkable items; export only the checked ones)
+
+        # Rank Scenes toggle (moved from Tools menu)
+        self.rank_toggle_btn = QPushButton("☆ Rank Scenes by Score")
+        self.rank_toggle_btn.setCheckable(True)
+        self.rank_toggle_btn.setChecked(False)
+        self.rank_toggle_btn.clicked.connect(self._toggle_rank_from_button)
+        right_v.addWidget(self.rank_toggle_btn)
+
+        # Create the actual QListWidget for displaying detected scenes
         self.scene_list = QListWidget(right_panel)
-        self.scene_list.setFixedWidth(350)
-        right_v.addWidget(self.scene_list, stretch=1)
-        
+        right_v.addWidget(self.scene_list, stretch=1)  
+        right_panel.setFixedWidth(350)
         self.layout.addWidget(right_panel)
         
         # clicking a scene seeks to its start; double-click plays from there
         self.scene_list.itemClicked.connect(self._jump_to_scene_start)
         self.scene_list.itemDoubleClicked.connect(self._play_from_scene_start)
+        self.scene_list.itemChanged.connect(lambda: self._update_selection_counter())
         
         # Update selection counter whenever checkboxes change
         self.scene_list.itemChanged.connect(self._update_selection_count)           
@@ -339,64 +355,53 @@ class AuraClipApp(QMainWindow):
         import_action = file_menu.addAction("Import Video")
         import_action.triggered.connect(self.import_video)
 
+        # Export Video action redirects to export_clips (same as button)
+        self.export_action_menu = file_menu.addAction("Export Video")
+        self.export_action_menu.triggered.connect(self.export_clips)
+        self.export_action_menu.setEnabled(False)    # Disabled at startup until a file is loaded
+
+        file_menu.addSeparator()
+
         exit_action = file_menu.addAction("Exit")
         exit_action.triggered.connect(self.close)
 
         # Detection Mode Menu 
-        mode_menu = menubar.addMenu("Detection Mode")
+        mode_menu = menubar.addMenu("Scene Detection Mode")
 
         manual_action = mode_menu.addAction("Manual")
-        pysd_action = mode_menu.addAction("PySceneDetect")
+        pysd_action = mode_menu.addAction("Default")
         ai_action = mode_menu.addAction("AI")
 
         manual_action.triggered.connect(lambda: self.set_mode(DetectionMode.MANUAL))
         pysd_action.triggered.connect(lambda: self.set_mode(DetectionMode.PYSDETECT))
         ai_action.triggered.connect(lambda: self.set_mode(DetectionMode.AI_EXPERIMENTAL))
-
-        # Top Highlights filter toggle 
-        self.top_highlights_only = False
-        self.top_highlights_action = QAction("Rank Scenes by Score", self)
-        self.top_highlights_action.setCheckable(True)
-        self.top_highlights_action.setChecked(False)
-        self.top_highlights_action.triggered.connect(self._toggle_top_highlights)
-
-        # Tools Menu (Detect / Export buttons)
-        tools_menu = menubar.addMenu("Tools")
-
-        self.detect_action = tools_menu.addAction("Detect Scenes")
-        self.detect_action.triggered.connect(self.detect_scenes)
-
-        self.export_action = tools_menu.addAction("Export Clips")
-        self.export_action.triggered.connect(self.export_clips)
-
-        # Top Highlights filter toggle ---
-        tools_menu.addSeparator()
-        tools_menu.addAction(self.top_highlights_action)
-
-         # Disabled at startup until a file is loaded
-        self.detect_action.setEnabled(False)                        
-        self.export_action.setEnabled(False)  
-            
+        
         # Settings Menu
         settings_menu = menubar.addMenu("Settings")
         settings_action = settings_menu.addAction("Preferences")
         settings_action.triggered.connect(self.open_settings)
 
-        # Help Menu
-        help_menu = menubar.addMenu("Help")
-
-        # Provides quick access to technical term definitions
-        glossary_action = help_menu.addAction("Glossary")
-        glossary_action.setShortcut("F1")  # Standard help key
-        glossary_action.triggered.connect(self.show_glossary)
-        glossary_action.setToolTip("View definitions of technical terms")
+        settings_menu.addSeparator()
         
-        help_menu.addSeparator()
-        
-        about_action = help_menu.addAction("About Aura Clip")
+        about_action = settings_menu.addAction("About Aura Clip")
         about_action.triggered.connect(self.show_about)
 
+        # Iteration 4: Dedicated menu for technical terms and workflow tips
+        # Helps users understand threshold, highlight score, audio energy, etc.
+        glossary_menu = menubar.addMenu("Glossary")
+
+        view_glossary_action = glossary_menu.addAction("Open Glossary")
+        view_glossary_action.triggered.connect(self.show_glossary)
+    
+        self.top_highlights_only = False
+        self.top_highlights_action = QAction("Rank Scenes by Score", self)
+        self.top_highlights_action.setCheckable(True)
+        self.top_highlights_action.setChecked(False)
+        self.top_highlights_action.triggered.connect(self._toggle_top_highlights)
+        
         print("Aura Clip initialized successfully.")
+
+        #--------------------------------------------------------------
 
         # Media player setup
         # Media is set to the preview; audio routed via QAudioOutput + 
@@ -422,13 +427,13 @@ class AuraClipApp(QMainWindow):
 
     # Helper to enable/disable both actions at once
     def set_actions_enabled(self, loaded: bool) -> None:
-        self.detect_action.setEnabled(loaded) 
-        self.export_action.setEnabled(loaded)
+        self.detect_btn.setEnabled(loaded)  
+        self.export_action_menu.setEnabled(loaded)
 
     # switching detection modes
     def update_mode_label(self):
         if settings.detection_mode is DetectionMode.PYSDETECT:
-            text = "Detection Mode: PySceneDetect"
+            text = "Detection Mode: Default"
         elif settings.detection_mode is DetectionMode.AI_EXPERIMENTAL:
             text = "Detection Mode: AI"
         else:
@@ -668,8 +673,8 @@ class AuraClipApp(QMainWindow):
 
         # Immediate user feedback + block re-entrancy while running
         self._progress_busy(f"Detecting scenes using {backend_label}... please wait.")
-        self.detect_action.setEnabled(False)
-        self.export_action.setEnabled(False)
+        self.detect_btn.setEnabled(False)
+        self.export_action_menu.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         
         # Console logging for debugging
@@ -749,8 +754,8 @@ class AuraClipApp(QMainWindow):
             self._progress_done("Detection Complete.")
             self.status.showMessage("Detection Done! Review scenes, then Export", 5000)
             QApplication.restoreOverrideCursor()
-            self.detect_action.setEnabled(True)
-            self.export_action.setEnabled(bool(self.current_file))
+            self.detect_btn.setEnabled(True)
+            self.export_action_menu.setEnabled(bool(self.current_file))
 
             # --- Update UI list (uses cached duration to avoid slow probe)
             if isinstance(payload, Exception):
@@ -1233,8 +1238,8 @@ class AuraClipApp(QMainWindow):
         # --- 6) Work: for each segment, run ffmpeg and update the list row text
         self._progress_steps(len(clamped), "Exporting clips...")
         self.status.showMessage("Exporting clips... please wait.")
-        self.detect_action.setEnabled(False)
-        self.export_action.setEnabled(False)
+        self.detect_btn.setEnabled(False)
+        self.export_action_menu.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         # --- 7) Run export in a worker thread (no UI freeze)
@@ -1273,8 +1278,8 @@ class AuraClipApp(QMainWindow):
             self._progress_done("Export complete.")
             self.status.showMessage("Export done! Clips saved to exports folder", 6000)
             QApplication.restoreOverrideCursor()
-            self.detect_action.setEnabled(True)
-            self.export_action.setEnabled(True)
+            self.detect_btn.setEnabled(True)
+            self.export_action_menu.setEnabled(True)
 
             # Error handling
             if isinstance(payload, Exception):
@@ -1443,6 +1448,64 @@ class AuraClipApp(QMainWindow):
         msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
         msg_box.exec()
         print("[Glossary] Displayed technical term definitions to user.")
+
+    # ===== Iteration 4 - Commit 1: New UI Helper Methods =====
+
+    def _select_all_scenes(self) -> None:
+        """Select all scenes in the list for export."""
+        for idx in range(self.scene_list.count()):
+            item = self.scene_list.item(idx)
+            if item.data(Qt.ItemDataRole.UserRole):  # Skip placeholder items
+                item.setCheckState(Qt.CheckState.Checked)
+        self._update_selection_counter()
+
+    def _deselect_all_scenes(self) -> None:
+        """Deselect all scenes in the list."""
+        for idx in range(self.scene_list.count()):
+            item = self.scene_list.item(idx)
+            if item.data(Qt.ItemDataRole.UserRole):  # Skip placeholder items
+                item.setCheckState(Qt.CheckState.Unchecked)
+        self._update_selection_counter()
+
+    def _toggle_rank_from_button(self, checked: bool) -> None:
+        """Handle rank toggle button state and update scene list."""
+        self.top_highlights_only = checked
+        # Update button text to show current state
+        if checked:
+            self.rank_toggle_btn.setText("★ Ranked by Score")
+            self.status.showMessage("Scenes ranked by score (highest first)", 2500)
+        else:
+            self.rank_toggle_btn.setText("☆ Rank Scenes by Score")
+            self.status.showMessage("Scenes shown in chronological order", 2500)
+        self._rebuild_scene_list()
+
+    def _update_selection_counter(self) -> None:
+        """Update the selection counter label showing how many scenes are checked."""
+        selected_count = 0
+        for idx in range(self.scene_list.count()):
+            item = self.scene_list.item(idx)
+            if item.checkState() == Qt.CheckState.Checked:
+                selected_count += 1
+        
+        # Update label with color coding
+        self.selection_label.setText(f"{selected_count} scenes selected")
+        if selected_count == 0:
+            self.selection_label.setStyleSheet("color: gray;")
+        else:
+            self.selection_label.setStyleSheet("color: #0A84FF;")  # Premiere Pro blue
+
+    def show_glossary(self) -> None:
+        """Show the glossary dialog (placeholder for Commit 5)."""
+        QMessageBox.information(
+            self,
+            "Glossary",
+            "Glossary content will be populated in Commit 5.\n\n"
+            "This will include:\n"
+            "• Technical term definitions\n"
+            "• Workflow tips\n"
+            "• Keyboard shortcuts\n"
+            "• UI interaction guide"
+        )
 
     def closeEvent(self, event):
         """
