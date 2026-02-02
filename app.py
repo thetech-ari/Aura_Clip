@@ -46,9 +46,9 @@ Basic User flow:
 from PyQt6.QtCore import Qt, QUrl, QThread, QObject, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QStatusBar, QMenuBar,
-    QFileDialog, QMessageBox, QWidget, QHBoxLayout,
+    QFileDialog, QMessageBox, QWidget, QHBoxLayout, QVBoxLayout,
     QListWidget, QListWidgetItem, QPushButton, QSlider, QStyle,
-    QProgressBar, QLabel
+    QProgressBar, QScrollArea, QLineEdit, QFrame
 )
 from PyQt6.QtGui import QAction
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -120,7 +120,7 @@ import imageio_ffmpeg
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 os.environ["IMAGEIO_FFMPEG_EXE"] = FFMPEG_EXE
 
-def _export_job(run_ffmpeg_slice, scene_count, basename, src_file, selections, duration, export_dir, report=None):
+def _export_job(run_ffmpeg_slice, custom_names, src_file, selections, duration, export_dir, report=None):
     """
         Background job for exporting selected scenes via ffmpeg.
         Runs outside the GUI thread via QtThread to avoid UI freezes.
@@ -149,18 +149,19 @@ def _export_job(run_ffmpeg_slice, scene_count, basename, src_file, selections, d
     exported_ok = 0     # count successes
     errors = []         # collect details for failures
 
-    # Pad scene index in filenames so they sort nicely
-    pad = max(2, len(str(scene_count)))
-
-    total = len(selections)                                                 
-    done = 0                                                                 
-    if callable(report):                                                   
+    # custom_names is a list of user-provided filenames (one per selection)
+    total = len(selections)
+    done = 0
+    if callable(report):
         report({"phase": "export", "done": done, "total": total})
 
-    # Export each selected scene using the provided ffmpeg helper
-    for (idx, start_s, end_s) in selections:
+    # Export each selected scene using user-provided names
+    for i, (idx, start_s, end_s) in enumerate(selections):
         scene_num = idx + 1
-        out_path = os.path.join(export_dir, f"{basename}_scene_{scene_num:0{pad}d}.mp4")
+
+        # Use custom name provided by user (already validated and sanitized)
+        filename = f"{custom_names[i]}.mp4"
+        out_path = os.path.join(export_dir, filename)
 
         # Run ffmpeg slice; returns (ok, stderr)
         ok, err = run_ffmpeg_slice(src_file, start_s, end_s, out_path)
@@ -184,6 +185,142 @@ def _export_job(run_ffmpeg_slice, scene_count, basename, src_file, selections, d
         "export_dir": export_dir,
     }
 
+# ===== Iteration 4 - Commit 3: Export Naming Dialog =====
+# Custom dialog for naming each exported clip individually
+class ExportNamingDialog(QWidget):
+    """
+    Dialog for naming each selected scene before export.
+    Shows scene previews and allows user to customize each filename.
+    """
+    def __init__(self, parent, scene_selections, default_basename):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle("Name Export Clips")
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.scene_selections = scene_selections  # List of (idx, start_s, end_s)
+        self.default_basename = default_basename
+        self.name_inputs = []  # Store QLineEdit widgets
+        self.result_names = None  # Will store final names if user accepts
+        
+        self.setup_ui()
+        
+    def setup_ui(self):
+        """Build the naming dialog UI."""
+        
+        layout = QVBoxLayout(self)
+        instructions = QLabel(
+            f"You have selected {len(self.scene_selections)} scene(s) to export.\n"
+            "Customize the filename for each clip below:"
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+        
+        # Scrollable area for clip names
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumHeight(400)
+        scroll.setMinimumWidth(500)
+        
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        
+        # Create name input for each selected scene
+        for i, (idx, start_s, end_s) in enumerate(self.scene_selections, start=1):
+            scene_num = idx + 1
+            
+            # Scene info label
+            info_label = QLabel(
+                f"Scene {scene_num}: {self._format_time(start_s)} → {self._format_time(end_s)}"
+            )
+            scroll_layout.addWidget(info_label)
+            
+            # Default filename suggestion
+            default_name = f"{self.default_basename}_scene_{scene_num:02d}"
+            
+            # Name input field
+            name_input = QLineEdit(self)
+            name_input.setText(default_name)
+            name_input.setPlaceholderText("Enter filename (without .mp4 extension)")
+            self.name_inputs.append(name_input)
+            scroll_layout.addWidget(name_input)
+            
+            # Add spacing between entries
+            if i < len(self.scene_selections):
+                line = QFrame()
+                line.setFrameShape(QFrame.Shape.HLine)
+                line.setFrameShadow(QFrame.Shadow.Sunken)
+                scroll_layout.addWidget(line)
+        
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll)
+        
+        # Button row (Cancel / Export)
+        button_row = QWidget(self)
+        button_layout = QHBoxLayout(button_row)
+        
+        cancel_btn = QPushButton("Cancel")
+        export_btn = QPushButton("Export All")
+        
+        cancel_btn.clicked.connect(self.reject)
+        export_btn.clicked.connect(self.accept)
+        
+        button_layout.addStretch()
+        button_layout.addWidget(cancel_btn)
+        button_layout.addWidget(export_btn)
+        
+        layout.addWidget(button_row)
+    
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds as HH:MM:SS."""
+        s = max(0, int(round(float(seconds))))
+        h = s // 3600
+        m = (s % 3600) // 60
+        sec = s % 60
+        return f"{h:02d}:{m:02d}:{sec:02d}"
+    
+    def accept(self):
+        """Validate and store user-provided names."""
+        # Collect all names
+        names = []
+        for input_widget in self.name_inputs:
+            name = input_widget.text().strip()
+            
+            # Validate: not empty and no invalid characters
+            if not name:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Filename",
+                    "All clips must have a filename. Please fill in all fields."
+                )
+                return
+            
+            # Remove any file extension if user added one
+            if name.lower().endswith('.mp4'):
+                name = name[:-4]
+            
+            # Sanitize filename (remove invalid characters)
+            invalid_chars = '<>:"/\\|?*'
+            for char in invalid_chars:
+                name = name.replace(char, '_')
+            
+            names.append(name)
+        
+        # Check for duplicates
+        if len(names) != len(set(names)):
+            QMessageBox.warning(
+                self,
+                "Duplicate Filenames",
+                "Each clip must have a unique filename. Please check for duplicates."
+            )
+            return
+        
+        self.result_names = names
+        self.close()
+    
+    def reject(self):
+        """User cancelled the export."""
+        self.result_names = None
+        self.close()
+
 # ----------------------------------------------- M A I N   W I N D O W ----------------------------------------
 class AuraClipApp(QMainWindow):
     
@@ -191,7 +328,7 @@ class AuraClipApp(QMainWindow):
         super().__init__()
 
         # --- Window chrome & state ---
-        self.setWindowTitle("Aura Clip - Iteration 3")
+        self.setWindowTitle("Aura Clip")
         self.setGeometry(200, 200, 900, 600)
 
         # Track the currently selected file path + detected scenes in memory
@@ -252,12 +389,21 @@ class AuraClipApp(QMainWindow):
         # Track "stop at scene end" behavior
         self._scene_stop_ms = None
 
+        #scriber setup
         t.addWidget(self.btn_back)
         t.addWidget(self.btn_play)
         t.addWidget(self.btn_fwd)
         t.addWidget(self.seek, stretch=1)
         t.addWidget(self.time_label)
         left_v.addWidget(transport)
+
+        # This makes the detection workflow more visible and intuitive
+        # Button is disabled until a video is loaded
+        self.detect_btn = QPushButton("Detect Scenes", left)
+        self.detect_btn.setMinimumHeight(36)  
+        self.detect_btn.clicked.connect(self.detect_scenes)
+        self.detect_btn.setEnabled(False)  # Disabled until file loaded
+        left_v.addWidget(self.detect_btn)
 
         # Usability improvement: Selection counter label + Select All/Deselect All buttons
         
@@ -284,8 +430,8 @@ class AuraClipApp(QMainWindow):
         selection_btn_layout = QHBoxLayout(selection_buttons)
         selection_btn_layout.setContentsMargins(0, 5, 0, 5)
         
-        self.btn_select_all = QPushButton("✓ Select All", selection_buttons)
-        self.btn_deselect_all = QPushButton("✗ Deselect All", selection_buttons)
+        self.btn_select_all = QPushButton("Select All", selection_buttons)
+        self.btn_deselect_all = QPushButton("Deselect All", selection_buttons)
         
         self.btn_select_all.clicked.connect(self._select_all_scenes)
         self.btn_deselect_all.clicked.connect(self._deselect_all_scenes)
@@ -297,17 +443,24 @@ class AuraClipApp(QMainWindow):
         selection_btn_layout.addWidget(self.btn_select_all)
         selection_btn_layout.addWidget(self.btn_deselect_all)
         right_v.addWidget(selection_buttons)
-        
-        # Scene list (checkable items; export only the checked ones)
+
+        # Rank Scenes toggle (moved from Tools menu)
+        self.rank_toggle_btn = QPushButton("Rank Scenes by Score")
+        self.rank_toggle_btn.setCheckable(True)
+        self.rank_toggle_btn.setChecked(False)
+        self.rank_toggle_btn.clicked.connect(self._toggle_rank_from_button)
+        right_v.addWidget(self.rank_toggle_btn)
+
+        # Create the actual QListWidget for displaying detected scenes
         self.scene_list = QListWidget(right_panel)
-        self.scene_list.setFixedWidth(350)
-        right_v.addWidget(self.scene_list, stretch=1)
-        
+        right_v.addWidget(self.scene_list, stretch=1)  
+        right_panel.setFixedWidth(350)
         self.layout.addWidget(right_panel)
         
         # clicking a scene seeks to its start; double-click plays from there
         self.scene_list.itemClicked.connect(self._jump_to_scene_start)
         self.scene_list.itemDoubleClicked.connect(self._play_from_scene_start)
+        self.scene_list.itemChanged.connect(lambda: self._update_selection_counter())
         
         # Update selection counter whenever checkboxes change
         self.scene_list.itemChanged.connect(self._update_selection_count)           
@@ -339,64 +492,53 @@ class AuraClipApp(QMainWindow):
         import_action = file_menu.addAction("Import Video")
         import_action.triggered.connect(self.import_video)
 
+        # Export Video action redirects to export_clips (same as button)
+        self.export_action_menu = file_menu.addAction("Export Video")
+        self.export_action_menu.triggered.connect(self.export_clips)
+        self.export_action_menu.setEnabled(False)    # Disabled at startup until a file is loaded
+
+        file_menu.addSeparator()
+
         exit_action = file_menu.addAction("Exit")
         exit_action.triggered.connect(self.close)
 
         # Detection Mode Menu 
-        mode_menu = menubar.addMenu("Detection Mode")
+        mode_menu = menubar.addMenu("Scene Detection Mode")
 
         manual_action = mode_menu.addAction("Manual")
-        pysd_action = mode_menu.addAction("PySceneDetect")
+        pysd_action = mode_menu.addAction("Default")
         ai_action = mode_menu.addAction("AI")
 
         manual_action.triggered.connect(lambda: self.set_mode(DetectionMode.MANUAL))
         pysd_action.triggered.connect(lambda: self.set_mode(DetectionMode.PYSDETECT))
         ai_action.triggered.connect(lambda: self.set_mode(DetectionMode.AI_EXPERIMENTAL))
-
-        # Top Highlights filter toggle 
-        self.top_highlights_only = False
-        self.top_highlights_action = QAction("Rank Scenes by Score", self)
-        self.top_highlights_action.setCheckable(True)
-        self.top_highlights_action.setChecked(False)
-        self.top_highlights_action.triggered.connect(self._toggle_top_highlights)
-
-        # Tools Menu (Detect / Export buttons)
-        tools_menu = menubar.addMenu("Tools")
-
-        self.detect_action = tools_menu.addAction("Detect Scenes")
-        self.detect_action.triggered.connect(self.detect_scenes)
-
-        self.export_action = tools_menu.addAction("Export Clips")
-        self.export_action.triggered.connect(self.export_clips)
-
-        # Top Highlights filter toggle ---
-        tools_menu.addSeparator()
-        tools_menu.addAction(self.top_highlights_action)
-
-         # Disabled at startup until a file is loaded
-        self.detect_action.setEnabled(False)                        
-        self.export_action.setEnabled(False)  
-            
+        
         # Settings Menu
         settings_menu = menubar.addMenu("Settings")
         settings_action = settings_menu.addAction("Preferences")
         settings_action.triggered.connect(self.open_settings)
 
-        # Help Menu
-        help_menu = menubar.addMenu("Help")
-
-        # Provides quick access to technical term definitions
-        glossary_action = help_menu.addAction("Glossary")
-        glossary_action.setShortcut("F1")  # Standard help key
-        glossary_action.triggered.connect(self.show_glossary)
-        glossary_action.setToolTip("View definitions of technical terms")
+        settings_menu.addSeparator()
         
-        help_menu.addSeparator()
-        
-        about_action = help_menu.addAction("About Aura Clip")
+        about_action = settings_menu.addAction("About Aura Clip")
         about_action.triggered.connect(self.show_about)
 
+        # Iteration 4: Dedicated menu for technical terms and workflow tips
+        # Helps users understand threshold, highlight score, audio energy, etc.
+        glossary_menu = menubar.addMenu("Glossary")
+
+        view_glossary_action = glossary_menu.addAction("Open Glossary")
+        view_glossary_action.triggered.connect(self.show_glossary)
+    
+        self.top_highlights_only = False
+        self.top_highlights_action = QAction("Rank Scenes by Score", self)
+        self.top_highlights_action.setCheckable(True)
+        self.top_highlights_action.setChecked(False)
+        self.top_highlights_action.triggered.connect(self._toggle_top_highlights)
+        
         print("Aura Clip initialized successfully.")
+
+        #--------------------------------------------------------------
 
         # Media player setup
         # Media is set to the preview; audio routed via QAudioOutput + 
@@ -422,13 +564,13 @@ class AuraClipApp(QMainWindow):
 
     # Helper to enable/disable both actions at once
     def set_actions_enabled(self, loaded: bool) -> None:
-        self.detect_action.setEnabled(loaded) 
-        self.export_action.setEnabled(loaded)
+        self.detect_btn.setEnabled(loaded)  
+        self.export_action_menu.setEnabled(loaded)
 
     # switching detection modes
     def update_mode_label(self):
         if settings.detection_mode is DetectionMode.PYSDETECT:
-            text = "Detection Mode: PySceneDetect"
+            text = "Detection Mode: Default"
         elif settings.detection_mode is DetectionMode.AI_EXPERIMENTAL:
             text = "Detection Mode: AI"
         else:
@@ -668,8 +810,8 @@ class AuraClipApp(QMainWindow):
 
         # Immediate user feedback + block re-entrancy while running
         self._progress_busy(f"Detecting scenes using {backend_label}... please wait.")
-        self.detect_action.setEnabled(False)
-        self.export_action.setEnabled(False)
+        self.detect_btn.setEnabled(False)
+        self.export_action_menu.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         
         # Console logging for debugging
@@ -705,6 +847,32 @@ class AuraClipApp(QMainWindow):
                 if mode == "start":
                     self.status.showMessage(f"Starting {backend_label} detection...")
                     print(f"[PROGRESS] Starting {backend_label} detection")
+
+                elif mode == "scene_count":
+                    # PySceneDetect reports total scene count after detection completes
+                    total_scenes = payload.get("total_scenes", 0)
+                    if total_scenes > 0:
+                        self.status.showMessage(
+                            f"Detected {total_scenes} scene(s) - Analyzing highlights..."
+                    )
+                        
+                elif mode == "audio_analysis_start":
+                    # Audio analysis phase (can be slow for long videos)
+                    total_scenes = payload.get("total_scenes", 0)
+                    self.progress.setRange(0, total_scenes)  # Switch to determinate
+                    self.progress.setValue(0)
+                    self.status.showMessage(
+                        f"Analyzing audio for {total_scenes} scene(s)..."
+                    )
+                
+                elif mode == "audio_progress":
+                    # Update progress bar during audio analysis
+                    done = payload.get("done", 0)
+                    total = payload.get("total", 1)
+                    self.progress.setValue(done)
+                    self.status.showMessage(
+                        f"Analyzing audio: scene {done}/{total}..."
+                    )
                     
                 elif mode == "ai_start":
                     self.status.showMessage("Loading AI models...")
@@ -715,19 +883,26 @@ class AuraClipApp(QMainWindow):
                     print("[PROGRESS] AI models loaded, finding scene cuts...")
                     
                 elif mode == "ai_analysis_start":
-                    total = payload.get("total_scenes", 0)
-                    self.status.showMessage(f"Found {total} scenes, starting AI analysis...")
-                    print(f"[PROGRESS] Analyzing {total} scenes with AI")
+                    total_scenes = payload.get("total_scenes", 0)
+                    self.progress.setRange(0, total_scenes)
+                    self.progress.setValue(0)
+                    self.status.showMessage(
+                        f"Running AI analysis on {total_scenes} scene(s)..."
+                    )
+                    print(f"[PROGRESS] Analyzing {total_scenes} scenes with AI")
                     
                 elif mode == "ai_analysis":
                     done = payload.get("done", 0)
-                    total = payload.get("total", 0)
-                    if total > 0:
-                        percent = int((done / total) * 100)
-                        self.status.showMessage(f"AI analyzing: Scene {done}/{total} ({percent}%)")
-                        # Print every 5 scenes to avoid console spam
-                        if done % 5 == 0 or done == total:
-                            print(f"[PROGRESS] AI analyzing scene {done}/{total} ({percent}%)")
+                    total = payload.get("total", 1)
+                    self.progress.setValue(done)
+                    self.status.showMessage(
+                        f"AI analysis: scene {done}/{total}..."
+                    )
+                    print(f"[PROGRESS] AI analyzing scene {done}/{total}")
+
+                elif mode == "ai_complete":
+                    elapsed_s = payload.get("elapsed_s", 0)
+                    self.status.showMessage(f"AI detection complete ({elapsed_s:.1f}s)")
                             
                 elif mode == "audio_analysis_start":
                     total = payload.get("total_scenes", 0)
@@ -749,8 +924,8 @@ class AuraClipApp(QMainWindow):
             self._progress_done("Detection Complete.")
             self.status.showMessage("Detection Done! Review scenes, then Export", 5000)
             QApplication.restoreOverrideCursor()
-            self.detect_action.setEnabled(True)
-            self.export_action.setEnabled(bool(self.current_file))
+            self.detect_btn.setEnabled(True)
+            self.export_action_menu.setEnabled(bool(self.current_file))
 
             # --- Update UI list (uses cached duration to avoid slow probe)
             if isinstance(payload, Exception):
@@ -1168,14 +1343,13 @@ class AuraClipApp(QMainWindow):
 
     def export_clips(self):
         """
-            Export all CHECKED scenes to ./exports as MP4 using ffmpeg, without freezing the UI
-            Uses QThread + Worker to run ffmpeg work off the GUI thread
-
-            Metrics added (Iteration 1 - Commit: Export Summary + Timings):
-            - requested (selected after clamping) vs ok vs failed
-            - total elapsed wall time
-            - first stderr snippet if any failures
-            - status-bar summary + console block
+        Iteration 4 - Commit 3: Enhanced export with directory selection and individual clip naming.
+        
+        Export workflow:
+            1. Validate preconditions (file loaded, scenes detected, selections made)
+            2. Let user choose export directory
+            3. Show naming dialog for each selected clip
+            4. Export with loading animation
         """
         
         # --- 1) Preconditions: ensure a file is loaded and scenes exist
@@ -1200,99 +1374,134 @@ class AuraClipApp(QMainWindow):
         if not self._ffmpeg_ok():  
             return 
 
-        # --- 3) Selection: collect ONLY checked rows; skip ~0s segments; scene number given in detect 
-        # stays the same during export to avoid user confusion
+        # --- 3) Selection: collect ONLY checked rows; skip ~0s segments
         duration = float(self._media_duration)
         if duration <= 0.05:
             QMessageBox.critical(
                 self, 
                 "Export Clips", 
                 "Invalid media duration; cannot export."
-                )
+            )
             return
 
-        # --- 4) Safety: clamp (start,end) to the media duration to avoid out-of-range/OOB writes
         clamped = self._collect_valid_selections(duration)  
-        if not clamped:                                     
-            return                
-
-        # --- 5) IO prep: create ./exports and verify we can write there
-        basename = os.path.splitext(os.path.basename(self.current_file))[0]
-        export_dir = os.path.join(os.getcwd(), "exports")
-        os.makedirs(export_dir, exist_ok=True)
-
-        # Check write permission to ensure we can export files
+        if not clamped:
+            return
+        
+        # ===== Iteration 4 - Commit 3: Directory Selection Dialog =====
+        # Let user choose where to save exports instead of hardcoded ./exports
+        export_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Export Directory",
+            os.path.expanduser("~"),  # Start in user's home directory
+            QFileDialog.Option.ShowDirsOnly
+        )
+        
+        if not export_dir:
+            self.status.showMessage("Export cancelled by user.", 3000)
+            return
+        
+        # Verify write permissions
         if not os.access(export_dir, os.W_OK):
             QMessageBox.critical(
                 self, 
                 "Export Clips", 
                 f"No write permission to:\n{export_dir}"
             )
-            return                                           
-
-        # --- 6) Work: for each segment, run ffmpeg and update the list row text
-        self._progress_steps(len(clamped), "Exporting clips...")
+            return
+        
+        # ===== Iteration 4 - Commit 3: Individual Clip Naming Dialog =====
+        # Show dialog for user to name each clip
+        basename = os.path.splitext(os.path.basename(self.current_file))[0]
+        naming_dialog = ExportNamingDialog(self, clamped, basename)
+        naming_dialog.show()
+        
+        # Wait for dialog to close
+        from PyQt6.QtCore import QEventLoop
+        loop = QEventLoop()
+        naming_dialog.destroyed.connect(loop.quit)
+        loop.exec()
+        
+        # Check if user cancelled
+        if naming_dialog.result_names is None:
+            self.status.showMessage("Export cancelled by user.", 3000)
+            return
+        
+        custom_names = naming_dialog.result_names
+        
+        # ===== Iteration 4 - Commit 3: Export Loading Animation =====
+        # Use indeterminate progress initially, then switch to determinate
+        self._progress_busy("Preparing export...")
         self.status.showMessage("Exporting clips... please wait.")
-        self.detect_action.setEnabled(False)
-        self.export_action.setEnabled(False)
+        self.detect_btn.setEnabled(False)
+        self.export_action_menu.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         # --- 7) Run export in a worker thread (no UI freeze)
         self._export_thread = QThread(self)
         self._export_worker = Worker(
-            _export_job,                     # background function
-            self._run_ffmpeg_slice,          # ffmpeg helper
-            self.scene_list.count(),         # total scene count (for file naming)
-            basename,                        # base name for output files
-            self.current_file,               # source video
-            clamped,                         # validated time ranges
-            duration,                        # duration (for context)
-            export_dir,                      # destination folder
+            _export_job,
+            self._run_ffmpeg_slice,
+            custom_names,  # User-provided names
+            self.current_file,
+            clamped,
+            duration,
+            export_dir,
         )
         self._export_worker.moveToThread(self._export_thread)
 
-        # Progress callback: update the determinate bar                           
-        def on_export_progress(payload):                                          
-            if not isinstance(payload, dict):                                    
-                return                                                         
-            if payload.get("phase") == "export":                                  
-                done = int(payload.get("done", 0))                                
-                total = max(1, int(payload.get("total", 1)))                             
-                self.progress.setVisible(True)                                  
-                self.progress.setRange(0, total)                          
-                self.progress.setValue(min(done, total))                          
+        # ===== Iteration 4 - Commit 3: Enhanced Progress Feedback =====
+        # Switch from indeterminate to determinate progress when export starts
+        def on_export_progress(payload):
+            if not isinstance(payload, dict):
+                return
+            if payload.get("phase") == "export":
+                done = int(payload.get("done", 0))
+                total = max(1, int(payload.get("total", 1)))
+                
+                # Switch to determinate progress bar
+                self.progress.setVisible(True)
+                self.progress.setRange(0, total)
+                self.progress.setValue(min(done, total))
+                
+                # Update status message with progress
+                if done < total:
+                    last_ok = payload.get("last_ok", True)
+                    scene_num = payload.get("scene", 0)
+                    status_icon = "✓" if last_ok else "✗"
+                    self.status.showMessage(
+                        f"Exporting clip {done}/{total} {status_icon} Scene {scene_num}..."
+                    )
+        
         self._export_worker.progress.connect(on_export_progress)
 
-        # Start the worker when thread starts (queued, non-blocking)            
+        # Start the worker when thread starts
         self._export_thread.started.connect(self._export_worker.run, Qt.ConnectionType.QueuedConnection)
 
         # --- 8) Finish chain: UI restore > quit thread > delete objects 
-        def on_finished(payload):   # Called automatically when the background export job completes.
-
-            # Restores UI controls, shows results, and reports metrics.
+        def on_finished(payload):
             self._progress_done("Export complete.")
-            self.status.showMessage("Export done! Clips saved to exports folder", 6000)
+            self.status.showMessage("Export done! Clips saved to chosen folder", 6000)
             QApplication.restoreOverrideCursor()
-            self.detect_action.setEnabled(True)
-            self.export_action.setEnabled(True)
+            self.detect_btn.setEnabled(True)
+            self.export_action_menu.setEnabled(True)
 
             # Error handling
             if isinstance(payload, Exception):
                 QMessageBox.critical(
                     self, 
                     "Export Error", 
-                    "Invalid video duration — cannot export."
-                    )
+                    f"Export failed:\n{payload}"
+                )
                 return
             
             # Extract metrics from the payload
-            requested = int(payload.get("requested", 0))                   
-            ok = int(payload.get("ok", 0))                                  
-            failed = int(payload.get("failed", 0))                         
-            export_dir = payload.get("export_dir") or os.getcwd()           
-            errors = payload.get("errors", [])                              
-            elapsed_s = float(payload.get("elapsed_s", 0.0))                
-            elapsed_ms = elapsed_s * 1000.0                     
+            requested = int(payload.get("requested", 0))
+            ok = int(payload.get("ok", 0))
+            failed = int(payload.get("failed", 0))
+            errors = payload.get("errors", [])
+            elapsed_s = float(payload.get("elapsed_s", 0.0))
+            elapsed_ms = elapsed_s * 1000.0
 
             # --- 9) Metrics: console + status bar + dialogs
             metrics_line = (
@@ -1301,23 +1510,21 @@ class AuraClipApp(QMainWindow):
             )
 
             # Log export summary 
-            self._log_run("export", {  
-                "file": os.path.basename(self.current_file),  
+            self._log_run("export", {
+                "file": os.path.basename(self.current_file),
                 "operation": "export", 
-                "requested": requested,   
-                "ok": ok,   
-                "failed": failed,  
-                "elapsed_s": round(elapsed_s, 3),  
-                "export_dir": export_dir,   
-            })   
+                "requested": requested,
+                "ok": ok,
+                "failed": failed,
+                "elapsed_s": round(elapsed_s, 3),
+                "export_dir": export_dir,
+            })
 
-
-            # Print results to console for empirical data logging
+            # Print results to console
             print("\n[Export Metrics]")
             print(f"File: {os.path.basename(self.current_file)}")
             print(metrics_line)
 
-            # If any scenes failed, print the first stderr snippet
             if failed:
                 n, s, e, err = errors[0]
                 snippet = (err or "").strip().splitlines()
@@ -1326,20 +1533,17 @@ class AuraClipApp(QMainWindow):
                 print(f"stderr: {snippet}")
             print("-" * 60)
 
-            # Keep metrics visible in the status bar; may add auto disappear in future
+            # Keep metrics visible in the status bar
             self.status.showMessage(metrics_line, 8000)
 
             # --- 10) User-facing dialogs summarizing outcome 
             if ok > 0 and failed == 0:
-                # All exports succeeded
                 QMessageBox.information(
                     self,
                     "Export Complete",
-                    f"Exported {ok} scene(s) to:\n{export_dir}\n\n{metrics_line}",
+                    f"Successfully exported {ok} clip(s) to:\n{export_dir}\n\n{metrics_line}",
                 )
-
             elif ok > 0 and failed > 0:
-                # Some succeeded, some failed; partial completion
                 n, s, e, err = errors[0]
                 QMessageBox.warning(
                     self,
@@ -1348,24 +1552,12 @@ class AuraClipApp(QMainWindow):
                     f"First failure (Scene {n} {s:.2f}s→{e:.2f}s):\n"
                     f"{err or '(no stderr)'}\n\n{metrics_line}",
                 )
-
             else:
-                # No successful exports
-                hint = errors[0][3] if errors else "ffmpeg returned a non-zero code."
                 QMessageBox.critical(
                     self,
                     "Export Error",
                     "No clips were successfully exported.\nPlease verify ffmpeg and try again.",
                 )
-
-            # --- 11) Cosmetic: visually mark exported scenes in the UI 
-            # Ensure 'clamped' is available from outer scope (validated selections)
-            if 'clamped' in locals() or 'clamped' in globals():             
-                for (idx, s, e) in clamped:                                
-                    if idx < self.scene_list.count():                      
-                        self.scene_list.item(idx).setText(                  
-                            f"Exported Scene {idx+1}: {s:.2f}s → {e:.2f}s"  
-                        )
 
         # --- 12) Connect worker to completion handler 
         self._export_worker.finished.connect(on_finished)
@@ -1443,6 +1635,64 @@ class AuraClipApp(QMainWindow):
         msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
         msg_box.exec()
         print("[Glossary] Displayed technical term definitions to user.")
+
+    # ===== Iteration 4 - Commit 1: New UI Helper Methods =====
+
+    def _select_all_scenes(self) -> None:
+        """Select all scenes in the list for export."""
+        for idx in range(self.scene_list.count()):
+            item = self.scene_list.item(idx)
+            if item.data(Qt.ItemDataRole.UserRole):  # Skip placeholder items
+                item.setCheckState(Qt.CheckState.Checked)
+        self._update_selection_counter()
+
+    def _deselect_all_scenes(self) -> None:
+        """Deselect all scenes in the list."""
+        for idx in range(self.scene_list.count()):
+            item = self.scene_list.item(idx)
+            if item.data(Qt.ItemDataRole.UserRole):  # Skip placeholder items
+                item.setCheckState(Qt.CheckState.Unchecked)
+        self._update_selection_counter()
+
+    def _toggle_rank_from_button(self, checked: bool) -> None:
+        """Handle rank toggle button state and update scene list."""
+        self.top_highlights_only = checked
+        # Update button text to show current state
+        if checked:
+            self.rank_toggle_btn.setText("★ Ranked by Score")
+            self.status.showMessage("Scenes ranked by score (highest first)", 2500)
+        else:
+            self.rank_toggle_btn.setText("☆ Rank Scenes by Score")
+            self.status.showMessage("Scenes shown in chronological order", 2500)
+        self._rebuild_scene_list()
+
+    def _update_selection_counter(self) -> None:
+        """Update the selection counter label showing how many scenes are checked."""
+        selected_count = 0
+        for idx in range(self.scene_list.count()):
+            item = self.scene_list.item(idx)
+            if item.checkState() == Qt.CheckState.Checked:
+                selected_count += 1
+        
+        # Update label with color coding
+        self.selection_label.setText(f"{selected_count} scenes selected")
+        if selected_count == 0:
+            self.selection_label.setStyleSheet("color: gray;")
+        else:
+            self.selection_label.setStyleSheet("color: #0A84FF;")  # Premiere Pro blue
+
+    def show_glossary(self) -> None:
+        """Show the glossary dialog (placeholder for Commit 5)."""
+        QMessageBox.information(
+            self,
+            "Glossary",
+            "Glossary content will be populated in Commit 5.\n\n"
+            "This will include:\n"
+            "• Technical term definitions\n"
+            "• Workflow tips\n"
+            "• Keyboard shortcuts\n"
+            "• UI interaction guide"
+        )
 
     def closeEvent(self, event):
         """
